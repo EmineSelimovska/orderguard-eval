@@ -1,0 +1,14 @@
+{
+  "name": "@orderguard/evaluator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Independent black-box evaluator scaffold for OrderGuard Eval",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --experimental-vm-modules ../node_modules/jest/bin/jest.js --runInBand --passWithNoTests --config jest.config.js"
+  },
+  "devDependencies": {
+    "jest": "^30.5.2"
+  }
+}
