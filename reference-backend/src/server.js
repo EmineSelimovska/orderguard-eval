@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApp } from './app.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
+import { initializeModelIndexes } from './models/index.js';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryEnv = resolve(packageRoot, '..', '.env');
@@ -13,16 +14,30 @@ dotenv.config({ path: existsSync(repositoryEnv) ? repositoryEnv : localEnv });
 const app = createApp();
 const port = Number(process.env.PORT ?? 3000);
 let server;
+let databaseConnected = false;
 
 try {
   await connectDatabase();
-  server = app.listen(port, () => {
-    console.log(`OrderGuard Eval reference backend listening on port ${port}`);
-  });
+  databaseConnected = true;
 } catch {
   console.error('Reference backend startup failed: could not connect to MongoDB Atlas');
   process.exitCode = 1;
   await disconnectDatabase();
+}
+
+if (databaseConnected) {
+  try {
+    await initializeModelIndexes();
+    server = app.listen(port, () => {
+      console.log(`OrderGuard Eval reference backend listening on port ${port}`);
+    });
+  } catch (error) {
+    console.error(
+      `Reference backend startup failed: ${error.message}; server not started`,
+    );
+    process.exitCode = 1;
+    await disconnectDatabase();
+  }
 }
 
 async function shutdown() {
