@@ -1,6 +1,9 @@
 import express from 'express';
 import Order from './models/order.js';
+import Payment from './models/payment.js';
 import Product from './models/product.js';
+import { createOrder } from './services/orders.js';
+import { createOrdersRouter } from './routes/orders.js';
 import { createTestProductFixturesRouter } from './routes/test-product-fixtures.js';
 
 export function createApp({
@@ -8,6 +11,8 @@ export function createApp({
   testSecret = process.env.BENCHMARK_TEST_SECRET,
   ProductModel = Product,
   OrderModel = Order,
+  PaymentModel = Payment,
+  createOrderService = createOrder,
 } = {}) {
   const app = express();
 
@@ -27,6 +32,11 @@ export function createApp({
   app.get('/health', (_request, response) => {
     response.json({ status: 'ok' });
   });
+  app.use('/api/orders', createOrdersRouter({
+    createOrderService,
+    OrderModel,
+    PaymentModel,
+  }));
 
   if (
     nodeEnv === 'test'
