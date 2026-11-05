@@ -3,7 +3,9 @@ import Order from './models/order.js';
 import Payment from './models/payment.js';
 import Product from './models/product.js';
 import { createOrder } from './services/orders.js';
+import { processPaymentWebhook } from './services/payment-webhooks.js';
 import { createOrdersRouter } from './routes/orders.js';
+import { createPaymentWebhooksRouter } from './routes/payment-webhooks.js';
 import { createTestProductFixturesRouter } from './routes/test-product-fixtures.js';
 
 export function createApp({
@@ -13,6 +15,7 @@ export function createApp({
   OrderModel = Order,
   PaymentModel = Payment,
   createOrderService = createOrder,
+  processPaymentWebhookService = processPaymentWebhook,
 } = {}) {
   const app = express();
 
@@ -36,6 +39,9 @@ export function createApp({
     createOrderService,
     OrderModel,
     PaymentModel,
+  }));
+  app.use('/api/webhooks', createPaymentWebhooksRouter({
+    processPaymentWebhookService,
   }));
 
   if (

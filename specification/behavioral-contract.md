@@ -97,7 +97,10 @@ Optional request body: `{"reason":"customer_request"}`. Repeated cancellation af
 No client-selected outcome or provider key is accepted. The backend uses the operation key persisted when the order was created. Every retry of that order uses the same key. A decline is terminal for that order; a new attempt requires a new order. A timeout is not a decline.
 
 - `200 OK`: payment succeeded and order is paid; includes `payment.status: "succeeded"`.
+- `200 OK`: a matching success was already committed by a webhook; return the normal success representation without repeating database or inventory effects.
 - `402 Payment Required`: mock provider declined; order is `payment_failed`, payment is `declined`, and stock is released. This order cannot be retried.
+- `402 Payment Required`: a matching decline was already committed by a webhook; return the normal decline representation without repeating database or inventory effects.
+- `409 PAYMENT_EVENT_CONFLICT`: a provider result contradicts an outcome already committed by a webhook; do not overwrite the committed state or repeat inventory effects.
 - `504 Gateway Timeout`: known not processed leaves payment `pending`, or processed-but-response-lost leaves payment `unknown`. The response identifies `outcome: "not_processed"` or `outcome: "unknown"` without claiming a decline. Retry is allowed with the same operation key.
 - `409 ORDER_NOT_PAYABLE`: order is paid, declined, cancelled, or otherwise terminal.
 - `404 NOT_FOUND`, `400 INVALID_REQUEST`, or `503 SERVICE_UNAVAILABLE` as applicable.
@@ -131,12 +134,26 @@ Request:
 }
 ```
 
-- `200 OK`: valid event applied. Exact duplicate returns `200` with `duplicate: true` and causes no second effect.
-- `202 Accepted`: late success after cancellation was recorded and an idempotent refund is pending.
+- Every `200 OK` response uses the JSON body `{"eventId":"evt_123","processingResult":"applied","duplicate":false}` with the actual event ID, processing result, and duplicate flag substituted.
+- `200 OK`: a valid outcome is applied, or a matching outcome already committed by the payment-attempt service is acknowledged without repeating state or inventory effects. A completed exact replay returns `200` with `duplicate: true`. For late-success compensation, a replay after refund completion returns `processingResult: "refund_completed"` and `duplicate: true`.
+- `200 OK`: if late-success compensation completes during the current request, return `processingResult: "refund_completed"` and `duplicate: false`.
+- `202 Accepted`: a late success after cancellation has been recorded and its idempotent refund remains pending. The body uses `processingResult: "refund_pending"`; `duplicate` is false if this request first recorded the event and true if the event was already recorded. Replaying resumes the refund with the same stable refund operation key. Return `202` while it remains pending and `200` with `processingResult: "refund_completed"` after completion.
 - `400 INVALID_REQUEST`: malformed event.
 - `404 PAYMENT_NOT_FOUND`: unknown payment/operation; event is not marked processed.
 - `409 EVENT_ID_PAYLOAD_CONFLICT`: event ID was previously used with a different payload.
-- `409 PAYMENT_EVENT_CONFLICT`: amount, currency, operation key, or state is inconsistent.
+- `409 PAYMENT_EVENT_CONFLICT`: amount, currency, operation key, or state is inconsistent, or the event contradicts an already-applied payment outcome. A conflicting event is not marked processed.
+
+Validate the request before computing `payloadHash`. The required `X-Benchmark-Run-Id` header is the sole source of `runId`; `runId` is not accepted in the JSON body. The body contains exactly `eventId`, `type`, `paymentId`, `operationKey`, `amountMinor`, and `currency`; reject missing or unknown fields. Build the canonical event as a JSON object with fields in exactly this order: `runId`, `eventId`, `type`, `paymentId`, `operationKey`, `amountMinor`, `currency`. Normalize `runId`, `eventId`, `paymentId`, and `operationKey` by trimming surrounding whitespace while preserving case and public ID prefixes. Require `type` to be exactly `payment.succeeded` or `payment.declined`, with no trimming or case conversion. Require `amountMinor` to be an integer and preserve its numeric value. Normalize `currency` by trimming and converting to uppercase, then validate it against supported currencies. Serialize the canonical object as compact UTF-8 JSON with no insignificant whitespace and compute its SHA-256 digest. The hash is independent of request property order and uses the normalized header run ID.
+
+After computing the canonical payload hash, first look up `{runId, eventId}`. If it exists with a different hash, return `409 EVENT_ID_PAYLOAD_CONFLICT`. For an exact replay, return the recorded result without repeating completed effects; if its result is `refund_pending`, resume compensation as specified below. For a new event ID, resolve the run-scoped Payment and linked Order and validate the operation key, amount, and currency; an unknown Payment/operation returns `404 PAYMENT_NOT_FOUND` without recording the event.
+
+Before applying eligibility rules for a new transition, recognize already-persisted matching outcomes: `Payment.succeeded` with `Order.paid` is a matching success; `Payment.declined` with `Order.payment_failed` is a matching decline; and `Payment.refunded` with `Order.cancelled` is a completed late-success compensation. Record this new event as `applied` for the first two pairs or `refund_completed` for the completed compensation, then acknowledge it without repeating state or inventory effects. Any mismatched pair or opposite outcome is contradictory and returns `409 PAYMENT_EVENT_CONFLICT` without recording that event.
+
+For a new ordinary outcome, accept `payment.succeeded` only when Payment is `pending`, `processing`, or `unknown`. Accept `payment.declined` only when Payment is `processing` or `unknown`; a decline event for a `pending` Payment is inconsistent. A success event for Payment `voided` or `succeeded` is also accepted only as a late-capture compensation when the linked Order is `cancelled` or `cancellation_pending_refund`; it must put/keep Payment in `refund_pending` and Order in `cancellation_pending_refund`, not mark the Order paid or treat the matching capture as fully handled. In all cases, verify the run, payment/order linkage, operation key, amount, and currency.
+
+Record a valid event atomically with the state changes it causes. `processingResult` is `applied` for a completed ordinary outcome; `refund_pending` after a late-success refund intent is committed; and `refund_completed` after compensation is durably completed. Persist the event and late-success refund intent, including a stable refund operation key, before calling the provider. Provider refund calls occur outside MongoDB transactions. On refund success, atomically persist Payment `refunded`, Order `cancelled`, and event `processingResult: "refund_completed"`. If the provider refund succeeds but this persistence fails, retain the durable `refund_pending` intent and retry the provider with the same key; its idempotent result permits safe completion. Replaying the event while the refund is pending resumes it; it must not return early merely because the event ID is already recorded.
+
+Webhook processing and the payment-attempt result may race. Reconcile a losing update against persisted state: if the persisted Payment/Order pair matches the same outcome, acknowledge success or decline using the normal payment-attempt response (`200` or `402`) or webhook response, without repeating database or inventory effects. If the persisted state contradicts the outcome, return `409 PAYMENT_EVENT_CONFLICT` without overwriting committed state. A matching outcome from the payment-attempt service does not itself make a new webhook event a duplicate; `duplicate` describes whether that webhook event ID and payload were already recorded.
 
 ### 2.6 Test-only inventory setup and run cleanup
 
@@ -222,6 +239,8 @@ Indexes: unique `{ runId: 1, orderId: 1 }`; unique `{ runId: 1, operationKey: 1 
 
 Required: `runId`, `eventId`, canonical `payloadHash`, `paymentId`, `operationKey`, event type, processing result, and `processedAt`.
 
+`processingResult` is one of `applied`, `refund_pending`, or `refund_completed`. Set it to `applied` when the event's ordinary outcome is durably applied or reconciled with an already-committed matching Payment/Order outcome. Set it to `refund_pending` atomically with the late-success refund intent, before calling the provider. Change it to `refund_completed` atomically with persisting Payment `refunded` and Order `cancelled`. Keep the record in `refund_pending` if the provider or completion persistence fails, so a replay can resume compensation.
+
 Indexes: unique `{ runId: 1, eventId: 1 }`; `{ runId: 1, paymentId: 1, processedAt: 1 }`.
 
 Indexes must be present and ready before a benchmark run starts. Duplicate-key errors are normal concurrency outcomes to handle, not server errors. If the deployment is sharded, index/shard-key compatibility must be confirmed before relying on a cluster-wide uniqueness claim.
@@ -235,12 +254,12 @@ States: `pending_payment`, `paid`, `payment_failed`, `cancellation_pending_refun
 | Initial state | Trigger and condition | Result | Reversible? | Concurrent outcome |
 |---|---|---|---|---|
 | None | Order creation claims stock and idempotency key | `pending_payment` | May proceed to a terminal result | Unique idempotency index permits only one order per run/key |
-| `pending_payment` | Provider success or valid success webhook wins | `paid`; inventory `consumed` | No | Conditional transition allows one winner; later cancel returns 409 |
+| `pending_payment` | Provider success or valid success webhook wins | `paid`; inventory `consumed` | No | Success webhook accepts Payment `pending`, `processing`, or `unknown`; conditional transition allows one winner; later cancel returns 409 |
 | `pending_payment` | Provider decline wins | `payment_failed`; inventory `released` | No | Conflicting success/cancel must reconcile; do not overwrite terminal state |
 | `pending_payment` | Cancellation wins while no capture is known | `cancelled`; inventory `released` | Normally no | A later success event may reopen compensation as below |
 | `pending_payment` | Cancellation wins but a capture is already known | `cancellation_pending_refund`; inventory `released` | Yes, to `cancelled` | Exactly one refund operation is issued |
-| `cancelled` | A late success event proves capture occurred | `cancellation_pending_refund` | Yes, to `cancelled` after refund | Do not mark order paid; record and compensate capture |
-| `cancellation_pending_refund` | Mock refund succeeds | `cancelled` | No | Repeated refund result is idempotent |
+| `cancelled` | A late success event proves capture occurred | `cancellation_pending_refund` | Yes, to `cancelled` after refund | Do not mark order paid; atomically record the event and refund intent, then compensate outside the transaction |
+| `cancellation_pending_refund` | Mock refund succeeds | `cancelled` | No | Replays resume a pending refund with the same stable key; repeated refund result is idempotent |
 | `paid` | Cancel request | Forbidden; remains `paid` | No | Return `409 ORDER_ALREADY_PAID` |
 | `payment_failed` | Retry same order | Forbidden | No | Return `409 ORDER_NOT_PAYABLE`; new order required |
 
@@ -253,17 +272,20 @@ States: `pending`, `processing`, `unknown`, `succeeded`, `declined`, `voided`, `
 | Initial state | Trigger | Result | Reversible? | Concurrent outcome |
 |---|---|---|---|---|
 | `pending` | Attempt starts | `processing` | Yes, while provider has not settled | Use same persisted operation key |
-| `processing` | Provider succeeds / success event | `succeeded` | Only to `refund_pending` for a cancellation race | Compare-and-set and event uniqueness prevent duplicate application |
-| `processing` | Provider declines / decline event | `declined` | No | Decline is terminal for its order |
+| `pending`, `processing`, or `unknown` | Provider succeeds / success event | `succeeded` | Only to `refund_pending` for a cancellation race | Success webhooks accept all three states; compare-and-set and event uniqueness prevent duplicate application |
+| `processing` or `unknown` | Provider declines / decline event | `declined` | No | Decline webhooks accept only these states; a decline event in `pending` conflicts |
 | `processing` | Known timeout before provider processing | `pending` | Yes | Retry same key; no charge exists |
 | `processing` | Provider processed but response timed out | `unknown` | Yes, after same-key retry/reconciliation | Retry returns the stored provider result, not a new charge |
 | `unknown` | Same-key retry/reconciliation yields success or decline | `succeeded` or `declined` | Success only to refund compensation | One terminal result is applied |
 | `pending` | Cancellation wins before capture | `voided` | No | Later capture event is treated as late success and compensated |
-| `succeeded` or `voided` | Late capture discovered while order cancellation won | `refund_pending` | Yes, to `refunded` | Stable refund operation key prevents a duplicate refund |
-| `refund_pending` | Mock refund succeeds | `refunded` | No | Repeated result is idempotent |
+| `succeeded` with Order `paid` | Matching success event or payment-attempt result is received | No state change | No | Recognize the matching terminal pair before eligibility checks; acknowledge with no repeated database or inventory effect |
+| `declined` with Order `payment_failed` | Matching decline event or payment-attempt result is received | No state change | No | Recognize the matching terminal pair before eligibility checks; acknowledge with no repeated database or inventory effect |
+| `refunded` with Order `cancelled` | Matching late-success event is received | No state change | No | Record/replay the event as `refund_completed`; do not issue another effective refund or inventory change |
+| `succeeded` or `voided` | Late capture discovered while order cancellation won | `refund_pending` | Yes, to `refunded` | Persist refund intent and stable refund key before calling provider; replays resume with the same key |
+| `refund_pending` | Mock refund succeeds | `refunded` | No | Persist completion with Order `cancelled` and event `refund_completed`; exact event replay returns `200 duplicate: true`; while pending, return `202` |
 | `declined`, `refunded` | New charge attempt | Forbidden | No | Return conflict; do not create a new operation for the same order |
 
-Webhook delivery and the payment-attempt response may race. The persisted terminal state and provider ledger must agree. A late success after order cancellation is compensated, never silently discarded.
+Webhook delivery and the payment-attempt response may race. Reconcile matching results as already applied, without repeating inventory effects; contradictory results must not overwrite persisted state and return `409 PAYMENT_EVENT_CONFLICT`. The persisted terminal state and provider ledger must agree. A late success after order cancellation is compensated, never silently discarded.
 
 ## 5. Mock payment provider contract
 
@@ -271,11 +293,11 @@ The provider is a deterministic test dependency, not a real payment integration.
 
 Interface behavior:
 
-- `charge(operationKey, amountMinor, currency)` can produce success, decline, timeout before processing, or the named `processed_response_timeout` outcome.
-- The provider ledger is keyed by `operationKey`. A repeated call returns the original operation/result and never creates another charge.
+- `charge(runId, operationKey, amountMinor, currency)` can produce success, decline, timeout before processing, or the named `processed_response_timeout` outcome.
+- The provider ledger is keyed by `(runId, operationKey)`. A repeated call in that run returns the original operation/result and never creates another charge.
 - Timeout-before-processing is a definite no-charge result; payment returns to `pending` and can be retried with the same key.
 - For `processed_response_timeout`, the mock provider successfully captures payment exactly once and sends no provider response to the backend. The backend returns `504` with `outcome: "unknown"`, stores payment status `unknown`, and leaves the order `pending_payment`. A retry with the same operation key returns the previously recorded success; no additional capture occurs. The backend applies the success, sets the order to `paid`, and returns `200`. A decline hidden by a response timeout is out of scope for v1.1.
-- `refund(refundOperationKey, originalOperationKey)` is available only for cancellation-race compensation. Repeats return the first refund result and never refund twice.
+- `refund(runId, refundOperationKey, originalOperationKey)` is available only for cancellation-race compensation. Repeats in that run return the first refund result and never refund twice.
 - The mock exposes operation/capture/refund observations to the evaluator through its own harness, not through candidate business endpoints.
 - Provider calls must occur outside MongoDB transactions. Persist intent before calling; persist result after. Recovery retries use stable keys.
 
@@ -286,6 +308,8 @@ Interface behavior:
 Inventory reservation uses one conditional single-document update equivalent to “match this run/SKU and `available >= quantity`, then decrement.” No prior read can authorize a later unconditional decrement. State transitions use a conditional update matching the expected current state/version. Inventory release checks an order’s `inventoryDisposition` so the same order cannot restock twice.
 
 MongoDB single-document writes are atomic. Unique indexes enforce order-key, payment-operation, and webhook-event uniqueness even when requests overlap. Mongoose’s `findOneAndUpdate()` is atomic except for an unindexed upsert; indexes required by this contract must be created before evaluation. [MongoDB atomicity](https://www.mongodb.com/docs/manual/core/write-operations-atomicity/), [Mongoose atomic updates](https://mongoosejs.com/docs/tutorials/findoneandupdate)
+
+Webhook event recording and its corresponding Payment, Order, and inventory transitions must commit atomically when they span multiple documents. The unique `{ runId, eventId }` index is the concurrency arbiter for duplicate deliveries; duplicate-key errors are normal concurrency outcomes. After a transaction abort caused by a competing delivery, read the winning event and compare its canonical payload hash before returning duplicate or payload-conflict. For an exact event replay with `processingResult: "applied"` or `"refund_completed"`, return `200` with `duplicate: true`. For an exact replay with `processingResult: "refund_pending"`, resume compensation outside the transaction; return `202` with `duplicate: true` if it remains pending, or `200` with `duplicate: true` after recording completion.
 
 ### Multi-document consistency
 
@@ -319,10 +343,12 @@ All scenarios assert both HTTP behavior and final observable state. Test data us
 
 - **Initial state:** Pending order/payment; mock ledger has one success for its operation key.
 - **Sequence:** Deliver the same success event twice, with a second run delivering both copies concurrently; separately reuse the ID with altered payload.
-- **Expected:** One effective transition and one processed-event record; exact replay is acknowledged; altered event is rejected.
-- **Invariants:** No duplicate capture or order transition; payment amount/currency/key match order; event identity is unique per run.
-- **Responses:** `200` then `200 duplicate:true`; altered payload `409 EVENT_ID_PAYLOAD_CONFLICT`.
+- **Expected:** One effective transition and one processed-event record; exact replay is acknowledged; altered event is rejected. A matching already-persisted `succeeded`/`paid` or `declined`/`payment_failed` pair is recognized before new-transition eligibility and causes no second effect.
+- **Invariants:** Success is accepted from Payment `pending`, `processing`, or `unknown`; decline is accepted from `processing` or `unknown` only. Matching already-applied outcomes are idempotent; contradictory outcomes conflict. No duplicate capture, order transition, or inventory effect; payment amount/currency/key match order; event identity and payload hash are unique/consistent per run.
+- **Responses:** Successful webhook bodies contain `eventId`, `processingResult`, and `duplicate`. New ordinary outcomes return `200` with `processingResult: "applied"` and `duplicate: false`; matching attempt-service outcomes use the same response. Exact replay after ordinary application or completed compensation returns `200` with `duplicate: true` and the stored result. Altered payload returns `409 EVENT_ID_PAYLOAD_CONFLICT`.
 - **Concurrency:** Evaluator releases duplicate webhook HTTP requests together; unique index and conditional transition serialize the effect.
+
+For a late success after cancellation, persist the webhook and refund intent before calling the provider. Set event `processingResult` to `refund_pending`; a new request that leaves compensation pending returns `202` with `duplicate: false`. A replay resumes the refund with the same stable refund key and returns `202` with `duplicate: true` while pending, or `200` with `processingResult: "refund_completed"` and `duplicate: true` after completion. If a webhook and payment-attempt result race, matching outcomes reconcile without duplicate inventory effects: the payment-attempt endpoint returns its normal `200` success or `402` decline response, and the webhook returns `200` with `processingResult: "applied"`. A contradictory outcome returns `409 PAYMENT_EVENT_CONFLICT` and does not overwrite persisted state.
 
 ### 7.4 Payment Timeout & Retry
 

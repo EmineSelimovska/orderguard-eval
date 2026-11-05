@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --experimental-vm-modules ../node_modules/jest/bin/jest.js --runInBand --passWithNoTests --config jest.config.js"
+    "test": "node --experimental-vm-modules ../node_modules/jest/bin/jest.js --runInBand --passWithNoTests --config jest.config.js",
+    "test:atlas:payment": "node tests/run-payment-atlas-integration.js"
   },
   "dependencies": {
     "dotenv": "^18.0.9",

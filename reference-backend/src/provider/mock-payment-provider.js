@@ -286,3 +286,5 @@ export function createMockPaymentProvider() {
     clearRun,
   };
 }
+
+export const mockPaymentProvider = createMockPaymentProvider();
