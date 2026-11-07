@@ -8,6 +8,8 @@ lerna-debug.log*
 instructions.md
 .env
 
+OrderGuard-Eval-Description.md
+
 
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
