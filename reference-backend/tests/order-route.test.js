@@ -32,9 +32,14 @@ const orderResult = {
 
 function createTestApp(
   serviceImplementation = jest.fn().mockResolvedValue(orderResult),
-  { order = orderResult.order, payment = orderResult.payment } = {},
+  {
+    order = orderResult.order,
+    payment = orderResult.payment,
+    paymentAttemptImplementation = jest.fn().mockResolvedValue(orderResult),
+  } = {},
 ) {
   const createOrderService = jest.fn(serviceImplementation);
+  const attemptPaymentService = jest.fn(paymentAttemptImplementation);
   const OrderModel = {
     findOne: jest.fn().mockResolvedValue(order),
   };
@@ -42,8 +47,14 @@ function createTestApp(
     findOne: jest.fn().mockResolvedValue(payment),
   };
   return {
-    app: createApp({ createOrderService, OrderModel, PaymentModel }),
+    app: createApp({
+      createOrderService,
+      attemptPaymentService,
+      OrderModel,
+      PaymentModel,
+    }),
     createOrderService,
+    attemptPaymentService,
     OrderModel,
     PaymentModel,
   };
@@ -66,6 +77,29 @@ function postOrder(app, {
   }
 
   return testRequest;
+}
+
+function postPaymentAttempt(app, {
+  runId = RUN_ID,
+  orderId = `ord_${ORDER_OBJECT_ID}`,
+  body,
+} = {}) {
+  let testRequest = request(app)
+    .post(`/api/orders/${orderId}/payment-attempts`);
+
+  if (runId !== null) {
+    testRequest = testRequest.set('X-Benchmark-Run-Id', runId);
+  }
+  if (body !== undefined) {
+    testRequest = testRequest.send(body);
+  }
+  return testRequest;
+}
+
+function serviceError(code) {
+  const error = new Error('private payment service detail');
+  error.code = code;
+  return error;
 }
 
 describe('POST /api/orders', () => {
@@ -288,5 +322,179 @@ describe('POST /api/orders', () => {
     expect(response.status).toBe(400);
     expect(response.body.error.code).toBe('INVALID_REQUEST');
     expect(createOrderService).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/orders/:orderId/payment-attempts', () => {
+  test('returns the normal success representation and scopes the service input', async () => {
+    const successfulResult = {
+      order: {
+        ...orderResult.order,
+        status: 'paid',
+        inventoryDisposition: 'consumed',
+      },
+      payment: { ...orderResult.payment, status: 'succeeded' },
+    };
+    const { app, attemptPaymentService } = createTestApp(undefined, {
+      paymentAttemptImplementation: async () => successfulResult,
+    });
+
+    const response = await postPaymentAttempt(app);
+
+    expect(response.status).toBe(200);
+    expect(response.body.order).toMatchObject({
+      id: `ord_${ORDER_OBJECT_ID}`,
+      runId: RUN_ID,
+      status: 'paid',
+      payment: {
+        id: 'pay_payment-id',
+        status: 'succeeded',
+        operationKey: 'op-1',
+      },
+    });
+    expect(attemptPaymentService).toHaveBeenCalledWith({
+      runId: RUN_ID,
+      orderId: ORDER_OBJECT_ID,
+    });
+  });
+
+  test('returns Payment Required for a definitive decline', async () => {
+    const declinedResult = {
+      order: {
+        ...orderResult.order,
+        status: 'payment_failed',
+        inventoryDisposition: 'released',
+      },
+      payment: { ...orderResult.payment, status: 'declined' },
+    };
+    const { app } = createTestApp(undefined, {
+      paymentAttemptImplementation: async () => declinedResult,
+    });
+
+    const response = await postPaymentAttempt(app);
+
+    expect(response.status).toBe(402);
+    expect(response.body).toMatchObject({
+      error: { code: 'PAYMENT_DECLINED' },
+      order: {
+        status: 'payment_failed',
+        payment: { status: 'declined' },
+        inventoryDisposition: 'released',
+      },
+    });
+  });
+
+  test.each([
+    ['not_processed', 'pending'],
+    ['unknown', 'unknown'],
+  ])('returns a 504 timeout with %s state', async (outcome, paymentStatus) => {
+    const timeoutResult = {
+      ...orderResult,
+      payment: { ...orderResult.payment, status: paymentStatus },
+      outcome,
+    };
+    const { app } = createTestApp(undefined, {
+      paymentAttemptImplementation: async () => timeoutResult,
+    });
+
+    const response = await postPaymentAttempt(app);
+
+    expect(response.status).toBe(504);
+    expect(response.body).toEqual({
+      error: {
+        code: 'PAYMENT_TIMEOUT',
+        message: 'Payment outcome requires retry',
+      },
+      payment: { status: paymentStatus, operationKey: 'op-1' },
+      outcome,
+    });
+  });
+
+  test.each([
+    ['missing run ID', { runId: null }],
+    ['malformed order ID', { orderId: 'not-an-order-id' }],
+    ['client-selected outcome', { body: { outcome: 'success' } }],
+    ['client-selected provider key', { body: { operationKey: 'client-key' } }],
+  ])('rejects %s before starting a payment attempt', async (_label, options) => {
+    const { app, attemptPaymentService } = createTestApp();
+
+    const response = await postPaymentAttempt(app, options);
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('INVALID_REQUEST');
+    expect(attemptPaymentService).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['NOT_FOUND', 404, 'NOT_FOUND'],
+    ['ORDER_NOT_PAYABLE', 409, 'ORDER_NOT_PAYABLE'],
+    ['PAYMENT_ATTEMPT_IN_PROGRESS', 409, 'PAYMENT_OUTCOME_UNKNOWN'],
+    ['PAYMENT_OUTCOME_CONFLICT', 409, 'PAYMENT_EVENT_CONFLICT'],
+    ['UNEXPECTED_ERROR', 503, 'SERVICE_UNAVAILABLE'],
+  ])('maps service error %s to a safe HTTP response', async (code, status, responseCode) => {
+    const { app } = createTestApp(undefined, {
+      paymentAttemptImplementation: async () => { throw serviceError(code); },
+    });
+
+    const response = await postPaymentAttempt(app);
+
+    expect(response.status).toBe(status);
+    expect(response.body.error.code).toBe(responseCode);
+    expect(JSON.stringify(response.body)).not.toContain('private payment service detail');
+  });
+
+  test('acknowledges a persisted matching webhook success without retrying the provider', async () => {
+    const { app, attemptPaymentService, OrderModel, PaymentModel } = createTestApp(undefined, {
+      order: {
+        ...orderResult.order,
+        status: 'paid',
+        inventoryDisposition: 'consumed',
+      },
+      payment: { ...orderResult.payment, status: 'succeeded' },
+      paymentAttemptImplementation: async () => { throw serviceError('ORDER_NOT_PAYABLE'); },
+    });
+
+    const response = await postPaymentAttempt(app);
+
+    expect(response.status).toBe(200);
+    expect(response.body.order).toMatchObject({
+      status: 'paid',
+      payment: { status: 'succeeded' },
+      inventoryDisposition: 'consumed',
+    });
+    expect(OrderModel.findOne).toHaveBeenCalledWith({
+      runId: RUN_ID,
+      _id: ORDER_OBJECT_ID,
+    });
+    expect(PaymentModel.findOne).toHaveBeenCalledWith({
+      runId: RUN_ID,
+      _id: orderResult.order.paymentId,
+      orderId: ORDER_OBJECT_ID,
+    });
+    expect(attemptPaymentService).toHaveBeenCalledTimes(1);
+  });
+
+  test('acknowledges a persisted matching webhook decline without releasing inventory again', async () => {
+    const { app } = createTestApp(undefined, {
+      order: {
+        ...orderResult.order,
+        status: 'payment_failed',
+        inventoryDisposition: 'released',
+      },
+      payment: { ...orderResult.payment, status: 'declined' },
+      paymentAttemptImplementation: async () => { throw serviceError('ORDER_NOT_PAYABLE'); },
+    });
+
+    const response = await postPaymentAttempt(app);
+
+    expect(response.status).toBe(402);
+    expect(response.body).toMatchObject({
+      error: { code: 'PAYMENT_DECLINED' },
+      order: {
+        status: 'payment_failed',
+        payment: { status: 'declined' },
+        inventoryDisposition: 'released',
+      },
+    });
   });
 });

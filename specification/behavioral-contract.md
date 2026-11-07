@@ -1,3 +1,4 @@
+
 # OrderGuard Eval Behavioral Contract v1.1
 
 **Status:** Authoritative public behavior contract for the Reference Backend and candidate implementations.
@@ -12,7 +13,7 @@ The service is a Node.js JavaScript ES-module application using Express, Mongoos
 
 Every benchmark request belongs to a unique `runId`. Business requests send it in `X-Benchmark-Run-Id`. Test setup and cleanup use the run ID in the path. Data and idempotency keys are scoped to a run. A run must not share products, orders, payments, or webhook records with another run.
 
-The confirmed Atlas database is `orderguard_eval`, reached using a standard `mongodb://` URI with three shard hosts. **Transaction support is not verified.** Before any transaction-dependent test is designed or run, verify the connected topology and execute an actual transaction against this deployment. No contract behavior below mandates that a particular operation use a transaction.
+The verified Atlas deployment uses the `orderguard_eval` database on an unsharded three-member replica set running MongoDB 8.0.36. Transaction support was verified against this deployment using a diagnostic that successfully committed, aborted, read back, and cleaned up test data. Any future topology or sharding change requires renewed transaction validation. No contract behavior mandates that a particular operation use a transaction.
 
 ### Common errors
 
@@ -87,7 +88,7 @@ Optional request body: `{"reason":"customer_request"}`. Repeated cancellation af
 - `200 OK`: cancellation completed; response has `status: "cancelled"`, payment `voided`, `declined`, or `refunded`, and inventory disposition `released`.
 - `202 Accepted`: capture was discovered after cancellation won; compensation is in progress and order is `cancellation_pending_refund`.
 - `409 ORDER_ALREADY_PAID`: payment/order success committed first. Paid-order cancellation/refunds are outside this MVP.
-- `409 PAYMENT_OUTCOME_UNKNOWN`: payment is processing or ambiguous; retry/reconcile the same operation before deciding whether cancellation is safe.
+- `409 PAYMENT_OUTCOME_UNKNOWN`: payment is processing or ambiguous; cancellation leaves the order, payment, and inventory unchanged. Retry/reconcile the same operation before deciding whether cancellation is safe; a later provider success must not be treated as a decline.
 - `404 NOT_FOUND`, `400 INVALID_REQUEST`, or `503 SERVICE_UNAVAILABLE` as applicable.
 
 ### 2.4 Attempt or retry payment
@@ -109,7 +110,10 @@ Example timeout response:
 
 ```json
 {
-  "error": { "code": "PAYMENT_TIMEOUT", "message": "Payment outcome requires retry" },
+  "error": {
+    "code": "PAYMENT_TIMEOUT",
+    "message": "Payment outcome requires retry"
+  },
   "payment": { "status": "unknown", "operationKey": "op_…" },
   "outcome": "unknown"
 }
@@ -143,7 +147,9 @@ Request:
 - `409 EVENT_ID_PAYLOAD_CONFLICT`: event ID was previously used with a different payload.
 - `409 PAYMENT_EVENT_CONFLICT`: amount, currency, operation key, or state is inconsistent, or the event contradicts an already-applied payment outcome. A conflicting event is not marked processed.
 
-Validate the request before computing `payloadHash`. The required `X-Benchmark-Run-Id` header is the sole source of `runId`; `runId` is not accepted in the JSON body. The body contains exactly `eventId`, `type`, `paymentId`, `operationKey`, `amountMinor`, and `currency`; reject missing or unknown fields. Build the canonical event as a JSON object with fields in exactly this order: `runId`, `eventId`, `type`, `paymentId`, `operationKey`, `amountMinor`, `currency`. Normalize `runId`, `eventId`, `paymentId`, and `operationKey` by trimming surrounding whitespace while preserving case and public ID prefixes. Require `type` to be exactly `payment.succeeded` or `payment.declined`, with no trimming or case conversion. Require `amountMinor` to be an integer and preserve its numeric value. Normalize `currency` by trimming and converting to uppercase, then validate it against supported currencies. Serialize the canonical object as compact UTF-8 JSON with no insignificant whitespace and compute its SHA-256 digest. The hash is independent of request property order and uses the normalized header run ID.
+Validate the request before computing `payloadHash`. The required `X-Benchmark-Run-Id` header is the sole source of `runId`; `runId` is not accepted in the JSON body. The body contains exactly `eventId`, `type`, `paymentId`, `operationKey`, `amountMinor`, and `currency`; reject missing or unknown fields.
+
+Build the canonical event as a JSON object with fields in exactly this order: `runId`, `eventId`, `type`, `paymentId`, `operationKey`, `amountMinor`, `currency`. Normalize `runId`, `eventId`, `paymentId`, and `operationKey` by trimming surrounding whitespace while preserving case and public ID prefixes. Require `type` to be exactly `payment.succeeded` or `payment.declined`, with no trimming or case conversion. Require `amountMinor` to be an integer and preserve its numeric value. Normalize `currency` by trimming and converting to uppercase, then validate it against supported currencies. Serialize the canonical object as compact UTF-8 JSON with no insignificant whitespace and compute its SHA-256 digest. The hash is independent of request property order and uses the normalized header run ID.
 
 After computing the canonical payload hash, first look up `{runId, eventId}`. If it exists with a different hash, return `409 EVENT_ID_PAYLOAD_CONFLICT`. For an exact replay, return the recorded result without repeating completed effects; if its result is `refund_pending`, resume compensation as specified below. For a new event ID, resolve the run-scoped Payment and linked Order and validate the operation key, amount, and currency; an unknown Payment/operation returns `404 PAYMENT_NOT_FOUND` without recording the event.
 
@@ -164,7 +170,12 @@ All endpoints under `/_test` exist only when `NODE_ENV=test` and a per-run `BENC
 Request:
 
 ```json
-{ "name": "Test item", "available": 5, "unitPriceMinor": 1250, "currency": "USD" }
+{
+  "name": "Test item",
+  "available": 5,
+  "unitPriceMinor": 1250,
+  "currency": "USD"
+}
 ```
 
 Returns `201 Created` for a new fixture product or `200 OK` for an idempotent setup of that SKU before orders exist. Invalid stock/price/currency returns `422`. Resetting a product while the run has active held orders returns `409 PRODUCT_HAS_ACTIVE_ORDERS`.
@@ -173,7 +184,7 @@ Returns `201 Created` for a new fixture product or `200 OK` for an idempotent se
 
 If any business request for the specified run is active, or any payment-provider operation is unfinished, cleanup returns `409` with error code `RUN_BUSY` and does not delete run data. An active operation is one that has started but has not reached a terminal result or a state that is safe for cleanup. A state is safe for cleanup only when no in-flight request, provider retry, callback, refund, or background task can still modify the run’s data; an unknown payment outcome is not safe until reconciled. The evaluator must wait for the relevant requests and provider operations to finish, then retry cleanup. It must use completion signals/state checks rather than arbitrary `sleep` intervals for synchronization. Cleanup must never delete data while an operation could still modify it.
 
-When no operation is active, cleanup deletes that run’s webhook events, payments, orders, and products in a referentially safe order. It returns `204 No Content`, is idempotent for an empty run, and must never delete another run’s data. Cleanup introduces no candidate synchronization hooks.
+When no operation is active, cleanup deletes that run’s webhook events, payments, orders, and products in a referentially safe order. It returns `204 No Content`, is idempotent for an empty run, and must never delete another run’s data.
 
 ### 2.7 Normalized test observations
 
@@ -185,33 +196,41 @@ Requires `NODE_ENV=test`, `BENCHMARK_TEST_SECRET`, and the `X-Benchmark-Test-Sec
 {
   "runId": "run_…",
   "products": [{ "sku": "SKU-1", "available": 3 }],
-  "orders": [{
-    "id": "ord_…",
-    "idempotencyKey": "key-1",
-    "sku": "SKU-1",
-    "quantity": 2,
-    "status": "pending_payment",
-    "inventoryDisposition": "held",
-    "paymentId": "pay_…"
-  }],
-  "payments": [{
-    "id": "pay_…",
-    "orderId": "ord_…",
-    "operationKey": "op_…",
-    "status": "unknown",
-    "amountMinor": 2500,
-    "currency": "USD",
-    "attemptCount": 1
-  }],
-  "processedWebhooks": [{
-    "eventId": "evt_123",
-    "payloadHash": "…",
-    "processingResult": "applied"
-  }]
+  "orders": [
+    {
+      "id": "ord_…",
+      "idempotencyKey": "key-1",
+      "sku": "SKU-1",
+      "quantity": 2,
+      "status": "pending_payment",
+      "inventoryDisposition": "held",
+      "paymentId": "pay_…"
+    }
+  ],
+  "payments": [
+    {
+      "id": "pay_…",
+      "orderId": "ord_…",
+      "operationKey": "op_…",
+      "status": "unknown",
+      "amountMinor": 2500,
+      "currency": "USD",
+      "attemptCount": 1
+    }
+  ],
+  "processedWebhooks": [
+    {
+      "eventId": "evt_123",
+      "payloadHash": "…",
+      "processingResult": "applied"
+    }
+  ]
 }
 ```
 
-The endpoint returns `200 OK`; arrays are empty when the run has no corresponding records. It must not include secrets or provider credentials. The snapshot is a candidate-reported observation, not independently authoritative proof of database contents. The evaluator must cross-check it with public business API responses and the independent mock-provider ledger, and verify persistence by restarting the backend and re-reading observable state. No collection names or internal schemas are prescribed.
+The endpoint returns `200 OK`; arrays are empty when the run has no corresponding records. It must not include secrets or provider credentials. The snapshot is a candidate-reported observation, not independently authoritative proof of database contents.
+
+The evaluator must cross-check it with public business API responses, the independent Mock Provider ledger, and the evaluator's read-only MongoDB observer. The observer discovers collections and retrieves run-scoped records using the contract-required `runId` field; it must not assume collection names. The evaluator must also verify persistence by restarting the backend and re-reading observable state.
 
 ## 3. Data model contract
 
@@ -256,8 +275,7 @@ States: `pending_payment`, `paid`, `payment_failed`, `cancellation_pending_refun
 | None | Order creation claims stock and idempotency key | `pending_payment` | May proceed to a terminal result | Unique idempotency index permits only one order per run/key |
 | `pending_payment` | Provider success or valid success webhook wins | `paid`; inventory `consumed` | No | Success webhook accepts Payment `pending`, `processing`, or `unknown`; conditional transition allows one winner; later cancel returns 409 |
 | `pending_payment` | Provider decline wins | `payment_failed`; inventory `released` | No | Conflicting success/cancel must reconcile; do not overwrite terminal state |
-| `pending_payment` | Cancellation wins while no capture is known | `cancelled`; inventory `released` | Normally no | A later success event may reopen compensation as below |
-| `pending_payment` | Cancellation wins but a capture is already known | `cancellation_pending_refund`; inventory `released` | Yes, to `cancelled` | Exactly one refund operation is issued |
+| `pending_payment` | Cancellation wins while Payment is still `pending` | `cancelled`; Payment `voided`; inventory `released` | Normally no | A later success webhook follows the late-capture row below |
 | `cancelled` | A late success event proves capture occurred | `cancellation_pending_refund` | Yes, to `cancelled` after refund | Do not mark order paid; atomically record the event and refund intent, then compensate outside the transaction |
 | `cancellation_pending_refund` | Mock refund succeeds | `cancelled` | No | Replays resume a pending refund with the same stable key; repeated refund result is idempotent |
 | `paid` | Cancel request | Forbidden; remains `paid` | No | Return `409 ORDER_ALREADY_PAID` |
@@ -298,6 +316,7 @@ Interface behavior:
 - Timeout-before-processing is a definite no-charge result; payment returns to `pending` and can be retried with the same key.
 - For `processed_response_timeout`, the mock provider successfully captures payment exactly once and sends no provider response to the backend. The backend returns `504` with `outcome: "unknown"`, stores payment status `unknown`, and leaves the order `pending_payment`. A retry with the same operation key returns the previously recorded success; no additional capture occurs. The backend applies the success, sets the order to `paid`, and returns `200`. A decline hidden by a response timeout is out of scope for v1.1.
 - `refund(runId, refundOperationKey, originalOperationKey)` is available only for cancellation-race compensation. Repeats in that run return the first refund result and never refund twice.
+- Charge and refund gates are configured and released through the evaluator control plane in [Cross-Package Architecture Decisions](architecture-decisions.md). A charge held at `before_processing` has not captured; a charge held at `after_capture_before_response` has durably captured but has not returned a response. Releasing the latter returns the result, except `processed_response_timeout`, which loses the response after capture. A refund held at `after_refund_before_response` has durably recorded its refund but has not returned a response; retrying the same refund key returns the original refund without creating another.
 - The mock exposes operation/capture/refund observations to the evaluator through its own harness, not through candidate business endpoints.
 - Provider calls must occur outside MongoDB transactions. Persist intent before calling; persist result after. Recovery retries use stable keys.
 
@@ -309,17 +328,19 @@ Inventory reservation uses one conditional single-document update equivalent to 
 
 MongoDB single-document writes are atomic. Unique indexes enforce order-key, payment-operation, and webhook-event uniqueness even when requests overlap. Mongoose’s `findOneAndUpdate()` is atomic except for an unindexed upsert; indexes required by this contract must be created before evaluation. [MongoDB atomicity](https://www.mongodb.com/docs/manual/core/write-operations-atomicity/), [Mongoose atomic updates](https://mongoosejs.com/docs/tutorials/findoneandupdate)
 
-Webhook event recording and its corresponding Payment, Order, and inventory transitions must commit atomically when they span multiple documents. The unique `{ runId, eventId }` index is the concurrency arbiter for duplicate deliveries; duplicate-key errors are normal concurrency outcomes. After a transaction abort caused by a competing delivery, read the winning event and compare its canonical payload hash before returning duplicate or payload-conflict. For an exact event replay with `processingResult: "applied"` or `"refund_completed"`, return `200` with `duplicate: true`. For an exact replay with `processingResult: "refund_pending"`, resume compensation outside the transaction; return `202` with `duplicate: true` if it remains pending, or `200` with `duplicate: true` after recording completion.
+Webhook event recording and its corresponding Payment, Order, and inventory transitions must commit atomically when they span multiple documents. The unique `{ runId, eventId }` index is the concurrency arbiter for duplicate deliveries; duplicate-key errors are normal concurrency outcomes. After a transaction abort caused by a competing delivery, read the winning event and compare its canonical payload hash before returning duplicate or payload-conflict.
+
+For an exact event replay with `processingResult: "applied"` or `"refund_completed"`, return `200` with `duplicate: true`. For an exact replay with `processingResult: "refund_pending"`, resume compensation outside the transaction; return `202` with `duplicate: true` if it remains pending, or `200` with `duplicate: true` after recording completion.
 
 ### Multi-document consistency
 
 Observable behavior must not leave stock reserved with no recoverable order, payment/order states permanently contradictory, or stock released twice. Implementations may use a transaction for multi-document changes if the deployed topology supports it, or a durable, idempotent reservation/saga and recovery strategy. Transactions are appropriate for atomic inventory/order/payment state changes across documents; they are not required for reads, unique-index deduplication, or a single-document conditional update.
 
-No external provider call may occur inside a transaction. Do not use `Promise.all` within a transaction. If transaction support is chosen, verify both topology and an actual transaction before depending on it in tests. If a saga is chosen, persist operation intent and enough state to resume/compensate after a process restart. Refund and stock-release operations must have stable identities and be idempotent.
+No external provider call may occur inside a transaction. Do not use `Promise.all` within a transaction. If transaction support is chosen, verify both topology and an actual transaction before depending on it in tests. The configured Atlas deployment has already passed a transaction diagnostic. If a saga is chosen, persist operation intent and enough state to resume/compensate after a process restart. Refund and stock-release operations must have stable identities and be idempotent.
 
-## 7. Five benchmark scenarios
+## 7. Six benchmark scenarios
 
-All scenarios assert both HTTP behavior and final observable state. Test data uses a fresh `runId`; no random sleeps are used.
+All scenarios assert HTTP behavior and final observable state. Test data uses a fresh `runId`; no random sleeps are used. The evaluator verifies results using the public API, candidate normalized observations, independent provider ledger, and read-only MongoDB observer where applicable.
 
 ### 7.1 Duplicate Order Prevention
 
@@ -361,12 +382,23 @@ For a late success after cancellation, persist the webhook and refund intent bef
 
 ### 7.5 Cancellation vs Payment Race
 
-- **Initial state:** Pending order with one held unit; mock success is available for its payment operation.
-- **Sequence:** Race cancel against payment success application/webhook. Run both release orders. Include a late success event after cancellation has completed.
-- **Expected:** If success commits first, order is paid and cancel returns `409`. If cancellation wins before capture, order is cancelled, payment voided, stock released. If capture exists but cancellation wins before app success, order enters `cancellation_pending_refund`, payment enters `refund_pending`, then order becomes cancelled after one refund. A late capture after cancellation follows the same compensation path.
-- **Invariants:** No cancelled order with uncompensated capture; no duplicate charge/refund or stock restoration; paid order is not silently cancelled.
-- **Responses:** Winning transition `200`; cancellation against paid/unknown outcome `409`; pending compensation `202`; webhook that initiates compensation `202`.
-- **Concurrency:** Evaluator uses the provider gate and webhook delivery to order events externally, then releases operations in each intended order. No candidate hook is required.
+- **Initial state:** Each branch uses a fresh run, a fixture product with 5 available, and one pending order for quantity 1. The order holds one unit, so available stock is 4.
+- **Payment first:** Configure a successful charge and complete the payment attempt before cancellation. The attempt returns `200`; the order is `paid`, Payment is `succeeded`, inventory disposition is `consumed`, and available stock remains 4. A subsequent cancel returns `409 ORDER_ALREADY_PAID`. The provider ledger has one capture and no refund.
+- **Cancellation first, no capture:** Do not start a payment attempt or provider charge. Commit cancellation first. It returns `200`; the order is `cancelled`, Payment is `voided`, inventory disposition is `released`, and available stock is 5. A subsequent payment attempt returns `409 ORDER_NOT_PAYABLE`; the provider ledger has no charge or capture and no refund.
+- **Captured but response delayed:** Configure `chargeOutcome: "processed_response_timeout"` with `holdAt: "after_capture_before_response"`, then start a payment attempt. Wait for the provider ledger to show one capture while the response is held. A cancel during this interval returns `409 PAYMENT_OUTCOME_UNKNOWN` and changes no state: the order remains `pending_payment`, Payment remains `processing`, inventory remains `held`, and available stock remains 4. Release the provider gate; the attempt returns `504` with `outcome: "unknown"`, and Payment becomes `unknown`. Retry with the same operation key; the provider returns the stored success, the attempt returns `200`, and the order becomes `paid` with Payment `succeeded` and inventory `consumed`. There is one capture and no refund. A later cancel returns `409 ORDER_ALREADY_PAID`.
+- **Late success after cancellation:** This is a separate compensation flow, not the captured-but-response-delayed attempt flow. Configure a successful charge held at `before_processing`. The Evaluator starts that charge through the provider data plane using its restricted client credential as a scenario fixture; it does not call the candidate payment-attempt endpoint, so candidate Payment remains `pending`. While the provider request is held and no capture exists, cancel the order. Cancellation returns `200`; the order is `cancelled`, Payment is `voided`, inventory disposition is `released`, and available stock is 5. Release the charge gate; the provider records one capture. Using facts from the provider ledger, deliver a success webhook. The webhook atomically records the event and stable refund intent, moves Payment to `refund_pending` and the order to `cancellation_pending_refund`, and leaves inventory released. The provider refund call is outside the transaction.
+- **Refund completion and replay:** If the refund completes and is persisted during that webhook request, return `200` with `processingResult: "refund_completed"` and `duplicate: false`. If the refund response is lost after the provider records it, retain `refund_pending`; return `202` with `processingResult: "refund_pending"` and `duplicate: false`. Replay the identical webhook; retry the same refund key, persist Payment `refunded`, Order `cancelled`, and event `refund_completed`, then return `200` with `duplicate: true`. Final inventory remains `released`, available stock remains 5, and the provider ledger contains exactly one capture and one refund. A completed exact replay returns `200 refund_completed` with `duplicate: true` and does not issue another effective refund.
+- **Invariants:** Cancellation never releases stock twice; a capture after cancellation is refunded once; the order is never marked paid after cancellation wins; a delayed response alone does not permit cancellation to win while Payment is `processing` or `unknown`.
+- **Synchronization:** Use provider gates, explicit request-completion signals, and ledger state to order each branch. Do not use arbitrary sleeps or candidate-only hooks. `202` means compensation remains pending in candidate state; if the refund completes during the current webhook request, the `200 refund_completed` rule in Section 2.5 applies.
+
+### 7.6 Persistence After Backend Restart
+
+- **Initial state:** A fresh run with a fixture product and no existing order.
+- **Sequence:** Start the backend as a separate child process. Create an order and complete the payment flow, leaving persisted order, payment, and inventory state. Stop the backend gracefully and start it again using the same database and configuration.
+- **Expected:** The backend starts successfully without resetting or deleting the run’s data. The same order and payment IDs remain retrievable after restart. The order and payment retain their final states, and inventory retains its final available quantity.
+- **Invariants:** A process restart must not lose or recreate persisted orders, payments, or inventory changes. Restart must not produce a duplicate order, payment, charge, or refund. The independent provider ledger must remain consistent with the persisted payment state.
+- **Verification:** Read the order through the public API and inspect the normalized observation endpoint after restart. Independently use the evaluator’s read-only MongoDB observer to discover collections and retrieve documents for the same `runId`. Compare the persisted records with the API and normalized observation results. Verify the provider ledger where the scenario includes a payment operation.
+- **Cleanup:** Run cleanup only after all verification is complete and all requests/provider operations are safe for cleanup.
 
 ## 8. Testing, isolation, and validation
 
@@ -375,9 +407,9 @@ For a late success after cancellation, persist the webhook and refund intent bef
 - Ensure required indexes are ready before issuing concurrent requests. Verify final database state and the mock provider ledger in addition to responses.
 - Use explicit latches and fixed event/request release plans, not random delays. Provider gates control payment races. Inventory validation separates a forced-race faulty-mutant positive control from repeated ordinary external concurrent batches. No candidate synchronization hooks are required; external batches do not prove that an arbitrary implementation’s internal read/write interleaving occurred.
 - Protect every `/_test` endpoint with `NODE_ENV=test` and `X-Benchmark-Test-Secret`, configured through `BENCHMARK_TEST_SECRET`. Keep the secret out of logs, business requests, provider requests, and committed files.
-- Cross-check the normalized observation endpoint with public business API responses and the evaluator-owned mock-provider ledger. Restart the backend and re-read relevant state to check persistence. Do not treat candidate-reported observations alone as independent proof of database contents.
+- Cross-check the normalized observation endpoint with public business API responses, evaluator-owned MongoDB observations, and the mock-provider ledger. Restart the backend and re-read relevant state to check persistence. Do not treat candidate-reported observations alone as independent proof of database contents.
 - Test the evaluator against the Reference Backend and deliberately faulty candidates (for example, no unique key, read-then-write stock check, webhook without dedupe, new key on retry, or cancel overwriting a paid order). Evaluator code must interact through documented interfaces and observable state only.
-- Transaction-dependent validation is blocked on verifying the live Atlas topology and a real transaction. Contract behavior can be implemented with a verified transaction strategy or a durable non-transaction strategy; tests must match the deployed design without weakening observable invariants.
+- Transaction-dependent behavior has been validated against the configured Atlas deployment. Implementations may use a verified transaction strategy or a durable non-transaction strategy; tests must match the deployed design without weakening observable invariants.
 
 ### Candidate restart and persistence verification procedure
 
@@ -400,12 +432,12 @@ Recommended top-level separation:
 
 ```text
 reference-backend/       # Correct example API and its own tests
-candidate-starter/       # Runnable Node/Express/Mongoose interfaces and infrastructure only
-evaluator/               # Independent black-box runner, provider harness, assertions, reports
-specification/           # This public contract and candidate task materials
+candidate-starter/        # Runnable Node/Express/Mongoose interfaces and infrastructure only
+evaluator/                # Independent black-box runner, provider harness, assertions, reports
+specification/            # This public contract and candidate task materials
 ```
 
-The Candidate Starter contains no order, inventory, payment, webhook, retry, or race-resolution business logic. It may contain server setup, database configuration, request/response types as JavaScript interfaces/stubs, fixture plumbing, and the provider client contract. Test-only fixture endpoints are infrastructure required by this contract, not business logic.
+The distributed Candidate Starter baseline contains no order, inventory, payment, webhook, retry, or race-resolution business logic. A candidate may add that implementation in its private working copy of the Starter; the Evaluator launches that modified copy. The Starter may contain server setup, database configuration, request/response types as JavaScript interfaces/stubs, fixture plumbing, and the provider client contract. Test-only fixture endpoints are infrastructure required by this contract, not business logic. Candidate implementations must not import Reference Backend business code.
 
 The Independent Evaluator must not import Reference Backend routes, models, services, or helpers. It launches the candidate, drives documented HTTP/provider interfaces, inspects only evaluator-authorized database/provider observations, and reports observable outcomes. Reference-only tests are not evaluator tests.
 
@@ -419,16 +451,19 @@ Report per scenario and per invariant, without numerical weights in this version
 - Provider operations, captures, and refunds per stable key.
 - Final order/payment states, inventory disposition, and invalid or contradictory combinations.
 - HTTP status/error codes, unexpected failures, and whether retries/replays returned consistent results.
+- Persistence verification results, including whether state survived backend restart and matched the independent MongoDB observer.
 
 Critical invariant categories that must cap the overall score (exact cap/weight is intentionally not set): overselling or negative inventory; duplicate effective order for one idempotency key; duplicate charge/refund; payment/order state contradiction; cancelled order with uncompensated captured payment; or non-idempotent duplicate webhook effects. Reports must state which critical invariant failed and the evidence. Do not invent results or claim scientific validation.
 
-## 11. Remaining verification and technical issues
+## 11. Implementation and validation notes
 
-No product-level design approval remains outstanding for v1.1. The following are implementation/validation tasks, not permissions to weaken this contract:
+The following implementation and validation facts apply to the current benchmark baseline:
 
-1. Verify Atlas deployment topology and execute an actual transaction before designing/running transaction-dependent tests.
-2. Validate that the evaluator’s external inventory request barrier detects deliberately faulty read-then-write implementations reliably. Black-box HTTP release cannot force internal interleaving without a shared hook; candidate hooks are explicitly not required.
-3. Implement test-mode isolation and per-run secret provisioning without logging or forwarding the secret.
-4. Validate that the normalized observation projection, public API, restart checks, and provider ledger are consistent without relying on candidate-reported observations alone.
+1. The configured Atlas deployment is an unsharded three-member replica set running MongoDB 8.0.36. Transaction support was verified through a diagnostic that committed, aborted, read back, and cleaned up test data.
+2. The Evaluator's MongoDB observer has been implemented using the native MongoDB Node.js driver. It discovers collections and retrieves documents by top-level `runId`. It has been exercised against the configured Atlas deployment during the six-scenario Reference Backend validation, including persistence-after-restart verification.
+3. Dedicated read-only MongoDB role permissions and write-denial behavior must be explicitly verified if they have not already been tested.
+4. The inventory race scenario uses an external request barrier. This does not guarantee internal overlap for arbitrary read-then-write candidate implementations. The evaluator should use a deliberately faulty validation mutant as a positive control and report the limits of black-box concurrency detection accurately.
+5. The Reference Backend completed all six benchmark scenarios with 86 of 86 assertions passing in the recorded validation run. This validates the current Reference Backend and evaluator integration; it does not mean the Candidate Starter is a completed implementation or that an AI candidate has passed.
+6. The Candidate Starter remains an infrastructure-only baseline. A candidate implementation must add the required business behavior before it can be evaluated for contract conformance.
 
-This contract describes intended benchmark behavior only. It does not claim that OrderGuard Eval is novel, validated, or that any implementation passes.
+This contract describes intended benchmark behavior and the current validation baseline. It does not claim scientific validation or guarantee that an untested candidate implementation conforms.

@@ -103,19 +103,30 @@ function isDuplicateKeyError(error) {
     && keyPattern.idempotencyKey === 1;
 }
 
+function isTransientTransactionError(error) {
+  return error?.hasErrorLabel?.('TransientTransactionError') === true
+    || error?.code === 112;
+}
+
+
+
 export async function createOrder(input, {
   OrderModel = Order,
   PaymentModel = Payment,
   inventoryReservation = reserveInventory,
   startSession = () => mongoose.startSession(),
+  transactionAttempt = 0,
 } = {}) {
-  const { runId, idempotencyKey, sku, quantity } = validateCreateOrderInput(input);
-  const requestHash = hashOrderRequest({ sku, quantity });
+  const { runId, idempotencyKey, sku, quantity } =
+    validateCreateOrderInput(input);
 
+  const requestHash = hashOrderRequest({ sku, quantity });
   const session = await startSession();
+
   let transactionStarted = false;
   let duplicateOrderCreationError;
   let transactionAborted = false;
+  let shouldRetryTransaction = false;
 
   try {
     await session.startTransaction();
@@ -137,12 +148,14 @@ export async function createOrder(input, {
         null,
         { session },
       );
+
       if (!payment) {
         throw new OrderPaymentMissingError();
       }
 
       await session.commitTransaction();
       transactionStarted = false;
+
       return { order: existingOrder, payment, replayed: true };
     }
 
@@ -168,6 +181,7 @@ export async function createOrder(input, {
     const { product } = reservation;
     const unitPriceMinor = product.unitPriceMinor;
     const lineAmountMinor = unitPriceMinor * quantity;
+
     if (
       !Number.isSafeInteger(unitPriceMinor)
       || unitPriceMinor < 0
@@ -182,6 +196,7 @@ export async function createOrder(input, {
     const orderId = new mongoose.Types.ObjectId();
     const paymentId = new mongoose.Types.ObjectId();
     const operationKey = `op_${new mongoose.Types.ObjectId().toString()}`;
+
     const orderData = {
       _id: orderId,
       runId,
@@ -201,6 +216,7 @@ export async function createOrder(input, {
       inventoryDisposition: 'held',
       version: 0,
     };
+
     const paymentData = {
       _id: paymentId,
       runId,
@@ -215,6 +231,7 @@ export async function createOrder(input, {
     };
 
     let order;
+
     try {
       [order] = await OrderModel.create([orderData], { session });
     } catch (error) {
@@ -225,6 +242,7 @@ export async function createOrder(input, {
     }
 
     const [payment] = await PaymentModel.create([paymentData], { session });
+
     await session.commitTransaction();
     transactionStarted = false;
 
@@ -244,15 +262,42 @@ export async function createOrder(input, {
       }
     }
 
+    if (
+      transactionAborted
+      && transactionAttempt < 5
+      && (
+        error?.hasErrorLabel?.('TransientTransactionError') === true
+        || error?.code === 112
+      )
+    ) {
+      shouldRetryTransaction = true;
+    }
+
     if (!duplicateOrderCreationError || !transactionAborted) {
-      throw error;
+      if (!shouldRetryTransaction) {
+        throw error;
+      }
     }
   } finally {
     await session.endSession();
   }
 
+  if (shouldRetryTransaction) {
+    return createOrder(input, {
+      OrderModel,
+      PaymentModel,
+      inventoryReservation,
+      startSession,
+      transactionAttempt: transactionAttempt + 1,
+    });
+  }
+
   try {
-    const winningOrder = await OrderModel.findOne({ runId, idempotencyKey });
+    const winningOrder = await OrderModel.findOne({
+      runId,
+      idempotencyKey,
+    });
+
     if (winningOrder) {
       if (winningOrder.requestHash !== requestHash) {
         throw new IdempotencyKeyReusedError();
@@ -262,6 +307,7 @@ export async function createOrder(input, {
         runId,
         orderId: String(winningOrder._id),
       });
+
       if (!payment) {
         throw new OrderPaymentMissingError();
       }

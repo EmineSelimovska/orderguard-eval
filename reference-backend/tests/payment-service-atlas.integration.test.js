@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { jest } from '@jest/globals';
+import { once } from 'node:events';
 import mongoose from 'mongoose';
 import { assertSafeAtlasIntegrationEnvironment } from './atlas-integration-safety.js';
 import { connectDatabase, disconnectDatabase } from '../src/config/database.js';
@@ -7,9 +8,9 @@ import { initializeModelIndexes } from '../src/models/index.js';
 import Order from '../src/models/order.js';
 import Payment from '../src/models/payment.js';
 import Product from '../src/models/product.js';
-import { mockPaymentProvider } from '../src/provider/mock-payment-provider.js';
 import { createOrder } from '../src/services/orders.js';
 import { attemptPayment } from '../src/services/payments.js';
+import { createProviderApp } from '../../mock-provider/src/app.js';
 
 const atlasDescribe = process.env.ORDERGUARD_ATLAS_INTEGRATION === '1'
   ? describe
@@ -20,23 +21,48 @@ atlasDescribe('Payment Service Atlas integration', () => {
 
   let runId;
   let connected = false;
+  let providerServer;
+  let providerUrl;
+  const providerClientToken = 'atlas-integration-client-token';
+  const providerAdminToken = 'atlas-integration-admin-token';
+  const previousProviderUrl = process.env.MOCK_PROVIDER_URL;
+  const previousProviderClientToken = process.env.MOCK_PROVIDER_CLIENT_TOKEN;
 
   beforeAll(async () => {
     assertSafeAtlasIntegrationEnvironment();
     await connectDatabase();
     connected = true;
     await initializeModelIndexes();
+
+    providerServer = createProviderApp({
+      clientToken: providerClientToken,
+      adminToken: providerAdminToken,
+    }).listen(0, '127.0.0.1');
+    await once(providerServer, 'listening');
+    providerUrl = `http://127.0.0.1:${providerServer.address().port}`;
+    process.env.MOCK_PROVIDER_URL = providerUrl;
+    process.env.MOCK_PROVIDER_CLIENT_TOKEN = providerClientToken;
   }, 60000);
 
   afterAll(async () => {
     if (connected) {
       await disconnectDatabase();
     }
+    if (providerServer) {
+      providerServer.closeAllConnections();
+      await new Promise((resolve) => providerServer.close(resolve));
+    }
+    if (previousProviderUrl === undefined) delete process.env.MOCK_PROVIDER_URL;
+    else process.env.MOCK_PROVIDER_URL = previousProviderUrl;
+    if (previousProviderClientToken === undefined) {
+      delete process.env.MOCK_PROVIDER_CLIENT_TOKEN;
+    } else {
+      process.env.MOCK_PROVIDER_CLIENT_TOKEN = previousProviderClientToken;
+    }
   });
 
   beforeEach(() => {
     runId = `atlas_pay_${randomUUID().replaceAll('-', '')}`;
-    mockPaymentProvider.clearRun(runId);
   });
 
   afterEach(async () => {
@@ -51,10 +77,37 @@ atlasDescribe('Payment Service Atlas integration', () => {
         Product.deleteMany({ runId }),
       ]);
     } finally {
-      mockPaymentProvider.clearRun(runId);
+      const cleanup = await fetch(`${providerUrl}/_control/v1/runs/${runId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${providerAdminToken}` },
+      });
+      expect(cleanup.status).toBe(204);
       runId = undefined;
     }
   });
+
+  async function configureCharge(runOperationKey, chargeOutcome) {
+    const response = await fetch(
+      `${providerUrl}/_control/v1/runs/${runId}/operations/${runOperationKey}`,
+      {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${providerAdminToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ chargeOutcome, holdAt: null }),
+      },
+    );
+    expect([200, 201]).toContain(response.status);
+  }
+
+  async function providerLedger() {
+    const response = await fetch(`${providerUrl}/_control/v1/runs/${runId}/ledger`, {
+      headers: { Authorization: `Bearer ${providerAdminToken}` },
+    });
+    expect(response.status).toBe(200);
+    return response.json();
+  }
 
   async function createReservedOrder() {
     const sku = `sku-${runId}`;
@@ -96,11 +149,7 @@ atlasDescribe('Payment Service Atlas integration', () => {
   test('commits success, consumes the hold, and does not decrement available stock again', async () => {
     const { order, payment } = await createReservedOrder();
     const tracker = realSessionTracker();
-    mockPaymentProvider.configureChargeOutcome(
-      runId,
-      payment.operationKey,
-      'success',
-    );
+    await configureCharge(payment.operationKey, 'success');
 
     await attemptPayment(
       { runId, orderId: String(order._id) },
@@ -125,7 +174,7 @@ atlasDescribe('Payment Service Atlas integration', () => {
       inventoryDisposition: 'consumed',
     });
     expect(product.available).toBe(3);
-    expect(mockPaymentProvider.inspectLedger(runId).captures).toHaveLength(1);
+    expect((await providerLedger()).captures).toHaveLength(1);
     expectTransactionStates(tracker, [
       'TRANSACTION_COMMITTED',
       'TRANSACTION_COMMITTED',
@@ -135,11 +184,7 @@ atlasDescribe('Payment Service Atlas integration', () => {
   test('commits decline and restores the reserved inventory once', async () => {
     const { order, payment } = await createReservedOrder();
     const tracker = realSessionTracker();
-    mockPaymentProvider.configureChargeOutcome(
-      runId,
-      payment.operationKey,
-      'decline',
-    );
+    await configureCharge(payment.operationKey, 'decline');
 
     await attemptPayment(
       { runId, orderId: String(order._id) },
@@ -163,7 +208,7 @@ atlasDescribe('Payment Service Atlas integration', () => {
       inventoryDisposition: 'released',
     });
     expect(product.available).toBe(5);
-    expect(mockPaymentProvider.inspectLedger(runId).captures).toHaveLength(0);
+    expect((await providerLedger()).captures).toHaveLength(0);
     expectTransactionStates(tracker, [
       'TRANSACTION_COMMITTED',
       'TRANSACTION_COMMITTED',
@@ -173,11 +218,7 @@ atlasDescribe('Payment Service Atlas integration', () => {
   test('allows only one concurrent claimant to call the provider', async () => {
     const { order, payment } = await createReservedOrder();
     const tracker = realSessionTracker();
-    mockPaymentProvider.configureChargeOutcome(
-      runId,
-      payment.operationKey,
-      'success',
-    );
+    await configureCharge(payment.operationKey, 'success');
 
     const results = await Promise.allSettled([
       attemptPayment(
@@ -201,7 +242,7 @@ atlasDescribe('Payment Service Atlas integration', () => {
 
     expect(storedPayment).toMatchObject({ status: 'succeeded', attemptCount: 1 });
     expect(storedOrder).toMatchObject({ status: 'paid', version: 2 });
-    expect(mockPaymentProvider.inspectLedger(runId).captures).toHaveLength(1);
+    expect((await providerLedger()).captures).toHaveLength(1);
     expect(tracker.sessions.length).toBeGreaterThanOrEqual(2);
     expect(tracker.sessions.some(({ transaction }) => (
       transaction.state === 'TRANSACTION_COMMITTED'
@@ -219,11 +260,7 @@ atlasDescribe('Payment Service Atlas integration', () => {
     const originalProductUpdate = Product.findOneAndUpdate;
     let sessionStartCount = 0;
 
-    mockPaymentProvider.configureChargeOutcome(
-      runId,
-      payment.operationKey,
-      'success',
-    );
+    await configureCharge(payment.operationKey, 'success');
 
     const readPersistedState = async () => ({
       payment: await Payment.findOne({
@@ -288,7 +325,7 @@ atlasDescribe('Payment Service Atlas integration', () => {
       )).rejects.toBe(persistenceError);
 
       const afterAbort = await readPersistedState();
-      const ledger = mockPaymentProvider.inspectLedger(runId);
+      const ledger = await providerLedger();
 
       expect(beforeTransaction).toMatchObject({
         payment: {

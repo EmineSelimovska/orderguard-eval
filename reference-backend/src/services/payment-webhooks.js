@@ -4,6 +4,7 @@ import Payment from '../models/payment.js';
 import ProcessedWebhook from '../models/processed-webhook.js';
 import Product from '../models/product.js';
 import { validateAndHashPaymentWebhook } from '../utils/payment-webhook-payload.js';
+import { processRefund } from './refunds.js';
 
 const PUBLIC_PAYMENT_ID_PATTERN = /^pay_([a-f\d]{24})$/i;
 
@@ -34,28 +35,43 @@ export class PaymentWebhookPayloadConflictError extends Error {
   }
 }
 
-function receipt(canonicalEvent, duplicate) {
+function receipt(canonicalEvent, duplicate, processingResult = 'applied') {
   return {
     eventId: canonicalEvent.eventId,
-    processingResult: 'applied',
+    processingResult,
     duplicate,
   };
 }
 
-function isMatchingTerminalOutcome(canonicalEvent, payment, order) {
+function matchingTerminalResult(canonicalEvent, payment, order) {
   if (
     canonicalEvent.type === 'payment.succeeded'
     && payment.status === 'succeeded'
     && order.status === 'paid'
     && order.inventoryDisposition === 'consumed'
   ) {
-    return true;
+    return 'applied';
   }
 
-  return canonicalEvent.type === 'payment.declined'
+  if (
+    canonicalEvent.type === 'payment.declined'
     && payment.status === 'declined'
     && order.status === 'payment_failed'
-    && order.inventoryDisposition === 'released';
+    && order.inventoryDisposition === 'released'
+  ) {
+    return 'applied';
+  }
+
+  if (
+    canonicalEvent.type === 'payment.succeeded'
+    && payment.status === 'refunded'
+    && order.status === 'cancelled'
+    && order.inventoryDisposition === 'released'
+  ) {
+    return 'refund_completed';
+  }
+
+  return null;
 }
 
 function verifyPaymentAndOrder(canonicalEvent, payment, order) {
@@ -79,13 +95,89 @@ function replayReceipt(canonicalEvent, payloadHash, storedEvent) {
   if (storedEvent.payloadHash !== payloadHash) {
     throw new PaymentWebhookPayloadConflictError();
   }
-  if (storedEvent.processingResult !== 'applied') {
+  if (!['applied', 'refund_pending', 'refund_completed'].includes(storedEvent.processingResult)) {
     throw new PaymentWebhookEventConflictError();
   }
-  return receipt(canonicalEvent, true);
+  return receipt(canonicalEvent, true, storedEvent.processingResult);
 }
 
-function webhookEventRecord(canonicalEvent, payloadHash) {
+function replayOutcome(canonicalEvent, payloadHash, storedEvent) {
+  return {
+    webhookReceipt: replayReceipt(canonicalEvent, payloadHash, storedEvent),
+    resumeRefund: storedEvent.processingResult === 'refund_pending',
+  };
+}
+
+function webhookOutcome(
+  canonicalEvent,
+  duplicate,
+  processingResult = 'applied',
+  resumeRefund = false,
+) {
+  return {
+    webhookReceipt: receipt(canonicalEvent, duplicate, processingResult),
+    resumeRefund,
+  };
+}
+
+async function finishWebhookOutcome({
+  result,
+  canonicalEvent,
+  payloadHash,
+  internalPaymentId,
+  ProcessedWebhookModel,
+  processRefundService,
+}) {
+  if (result.resumeRefund) {
+    try {
+      const refundResult = await processRefundService({
+        runId: canonicalEvent.runId,
+        paymentId: internalPaymentId,
+        eventId: canonicalEvent.eventId,
+      });
+      const completed = refundResult?.event?.processingResult === 'refund_completed'
+        || (
+          refundResult?.payment?.status === 'refunded'
+          && refundResult?.order?.status === 'cancelled'
+        );
+      return receipt(
+        canonicalEvent,
+        result.webhookReceipt.duplicate,
+        completed ? 'refund_completed' : 'refund_pending',
+      );
+    } catch (error) {
+      const storedEvent = await findStoredEvent(
+        ProcessedWebhookModel,
+        canonicalEvent.runId,
+        canonicalEvent.eventId,
+      );
+      if (!storedEvent) {
+        throw error;
+      }
+      if (storedEvent.payloadHash !== payloadHash) {
+        throw new PaymentWebhookPayloadConflictError();
+      }
+      if (storedEvent.processingResult === 'refund_pending') {
+        return receipt(
+          canonicalEvent,
+          result.webhookReceipt.duplicate,
+          'refund_pending',
+        );
+      }
+      if (storedEvent.processingResult === 'refund_completed') {
+        return receipt(
+          canonicalEvent,
+          result.webhookReceipt.duplicate,
+          'refund_completed',
+        );
+      }
+      throw error;
+    }
+  }
+  return result.webhookReceipt;
+}
+
+function webhookEventRecord(canonicalEvent, payloadHash, processingResult = 'applied') {
   return {
     runId: canonicalEvent.runId,
     eventId: canonicalEvent.eventId,
@@ -93,7 +185,7 @@ function webhookEventRecord(canonicalEvent, payloadHash) {
     paymentId: canonicalEvent.paymentId,
     operationKey: canonicalEvent.operationKey,
     type: canonicalEvent.type,
-    processingResult: 'applied',
+    processingResult,
     processedAt: new Date(),
   };
 }
@@ -164,15 +256,16 @@ async function recordMatchingOutcome({
           OrderModel,
           session: transactionSession,
         });
-        if (!isMatchingTerminalOutcome(canonicalEvent, payment, order)) {
+        const processingResult = matchingTerminalResult(canonicalEvent, payment, order);
+        if (!processingResult) {
           throw new PaymentWebhookEventConflictError();
         }
 
         await ProcessedWebhookModel.create(
-          [webhookEventRecord(canonicalEvent, payloadHash)],
+          [webhookEventRecord(canonicalEvent, payloadHash, processingResult)],
           { session: transactionSession },
         );
-        return receipt(canonicalEvent, false);
+        return receipt(canonicalEvent, false, processingResult);
       });
     } catch (error) {
       let storedEvent;
@@ -207,6 +300,7 @@ export async function processPaymentWebhook({
   PaymentModel = Payment,
   ProductModel = Product,
   ProcessedWebhookModel = ProcessedWebhook,
+  processRefundService = processRefund,
   startSession = () => mongoose.startSession(),
 } = {}) {
   const { canonicalEvent, payloadHash } = validateAndHashPaymentWebhook({
@@ -219,9 +313,10 @@ export async function processPaymentWebhook({
   }
 
   const session = await startSession();
+  let result;
   try {
     try {
-      const result = await session.withTransaction(async (transactionSession) => {
+      result = await session.withTransaction(async (transactionSession) => {
         const storedEvent = await ProcessedWebhookModel.findOne(
           {
             runId: canonicalEvent.runId,
@@ -231,7 +326,7 @@ export async function processPaymentWebhook({
           { session: transactionSession },
         );
         if (storedEvent) {
-          return replayReceipt(canonicalEvent, payloadHash, storedEvent);
+          return replayOutcome(canonicalEvent, payloadHash, storedEvent);
         }
 
         const { payment, order } = await findPaymentAndOrder({
@@ -242,18 +337,78 @@ export async function processPaymentWebhook({
           session: transactionSession,
         });
 
-        await ProcessedWebhookModel.create(
-          [webhookEventRecord(canonicalEvent, payloadHash)],
-          {
-            session: transactionSession,
-          },
-        );
-
-        if (isMatchingTerminalOutcome(canonicalEvent, payment, order)) {
-          return receipt(canonicalEvent, false);
+        const matchingResult = matchingTerminalResult(canonicalEvent, payment, order);
+        if (matchingResult) {
+          await ProcessedWebhookModel.create(
+            [webhookEventRecord(canonicalEvent, payloadHash, matchingResult)],
+            { session: transactionSession },
+          );
+          return webhookOutcome(canonicalEvent, false, matchingResult);
         }
 
         const succeeded = canonicalEvent.type === 'payment.succeeded';
+        if (
+          succeeded
+          && ['voided', 'succeeded', 'refund_pending'].includes(payment.status)
+          && ['cancelled', 'cancellation_pending_refund'].includes(order.status)
+          && order.inventoryDisposition === 'released'
+          && (
+            payment.status !== 'refund_pending'
+            || order.status === 'cancellation_pending_refund'
+          )
+        ) {
+          const refundOperationKey = payment.refundOperationKey
+            || `refund_${payment.operationKey}`;
+          if (order.status === 'cancelled') {
+            const updatedOrder = await OrderModel.findOneAndUpdate(
+              {
+                runId: canonicalEvent.runId,
+                _id: order._id,
+                paymentId: String(payment._id),
+                status: 'cancelled',
+                inventoryDisposition: 'released',
+                version: order.version,
+              },
+              {
+                $set: { status: 'cancellation_pending_refund' },
+                $inc: { version: 1 },
+              },
+              { new: true, runValidators: true, session: transactionSession },
+            );
+            if (!updatedOrder) {
+              throw new PaymentWebhookEventConflictError();
+            }
+          }
+
+          const updatedPayment = await PaymentModel.findOneAndUpdate(
+            {
+              runId: canonicalEvent.runId,
+              _id: payment._id,
+              orderId: String(order._id),
+              operationKey: canonicalEvent.operationKey,
+              status: payment.status,
+            },
+            {
+              $set: {
+                status: 'refund_pending',
+                lastSafeOutcome: 'succeeded',
+                refundOperationKey,
+                ...(!payment.capturedAt ? { capturedAt: new Date() } : {}),
+              },
+            },
+            { new: true, runValidators: true, session: transactionSession },
+          );
+          if (!updatedPayment) {
+            throw new PaymentWebhookEventConflictError();
+          }
+
+          await ProcessedWebhookModel.create(
+            [webhookEventRecord(canonicalEvent, payloadHash, 'refund_pending')],
+            { session: transactionSession },
+          );
+          return webhookOutcome(canonicalEvent, false, 'refund_pending', true);
+        }
+
         const allowedPaymentStates = succeeded
           ? ['pending', 'processing', 'unknown']
           : ['processing', 'unknown'];
@@ -264,6 +419,11 @@ export async function processPaymentWebhook({
         ) {
           throw new PaymentWebhookEventConflictError();
         }
+
+        await ProcessedWebhookModel.create(
+          [webhookEventRecord(canonicalEvent, payloadHash)],
+          { session: transactionSession },
+        );
 
         const updatedPayment = await PaymentModel.findOneAndUpdate(
           {
@@ -332,13 +492,12 @@ export async function processPaymentWebhook({
           }
         }
 
-        return receipt(canonicalEvent, false);
+        return webhookOutcome(canonicalEvent, false);
       });
 
-      if (!result) {
+      if (!result || !result.webhookReceipt) {
         throw new Error('Payment webhook transaction returned no result');
       }
-      return result;
     } catch (error) {
       let storedEvent;
       try {
@@ -355,9 +514,11 @@ export async function processPaymentWebhook({
         );
       }
       if (storedEvent) {
-        return replayReceipt(canonicalEvent, payloadHash, storedEvent);
-      }
-      if (error instanceof PaymentWebhookEventConflictError) {
+        result = replayOutcome(canonicalEvent, payloadHash, storedEvent);
+      } else {
+        if (!(error instanceof PaymentWebhookEventConflictError)) {
+          throw error;
+        }
         let currentState;
         try {
           currentState = await findPaymentAndOrder({
@@ -380,26 +541,38 @@ export async function processPaymentWebhook({
           );
         }
         if (
-          isMatchingTerminalOutcome(
+          matchingTerminalResult(
             canonicalEvent,
             currentState.payment,
             currentState.order,
           )
         ) {
-          return recordMatchingOutcome({
-            canonicalEvent,
-            payloadHash,
-            internalPaymentId: paymentIdMatch[1],
-            OrderModel,
-            PaymentModel,
-            ProcessedWebhookModel,
-            startSession,
-          });
+          result = {
+            webhookReceipt: await recordMatchingOutcome({
+              canonicalEvent,
+              payloadHash,
+              internalPaymentId: paymentIdMatch[1],
+              OrderModel,
+              PaymentModel,
+              ProcessedWebhookModel,
+              startSession,
+            }),
+            resumeRefund: false,
+          };
+        } else {
+          throw error;
         }
       }
-      throw error;
     }
   } finally {
     await session.endSession();
   }
+  return finishWebhookOutcome({
+    result,
+    canonicalEvent,
+    payloadHash,
+    internalPaymentId: paymentIdMatch[1],
+    ProcessedWebhookModel,
+    processRefundService,
+  });
 }

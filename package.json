@@ -7,14 +7,17 @@
   "workspaces": [
     "reference-backend",
     "candidate-starter",
-    "evaluator"
+    "evaluator",
+    "mock-provider"
   ],
   "scripts": {
     "start:reference": "npm run start --workspace=@orderguard/reference-backend",
     "dev:reference": "npm run dev --workspace=@orderguard/reference-backend",
     "start:candidate": "npm run start --workspace=@orderguard/candidate-starter",
+    "start:provider": "npm run start --workspace=@orderguard/mock-provider",
     "start:evaluator": "npm run start --workspace=@orderguard/evaluator",
     "test:reference": "npm run test --workspace=@orderguard/reference-backend",
+    "test:provider": "npm run test --workspace=@orderguard/mock-provider",
     "test:evaluator": "npm run test --workspace=@orderguard/evaluator",
     "test": "npm run test --workspaces --if-present"
   }

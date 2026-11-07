@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import Order from '../models/order.js';
 import Payment from '../models/payment.js';
 import Product from '../models/product.js';
-import { mockPaymentProvider } from '../provider/mock-payment-provider.js';
+import { mockPaymentProviderClient } from '../provider/mock-payment-provider-client.js';
 
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
@@ -285,7 +285,7 @@ export async function attemptPayment({
   OrderModel = Order,
   PaymentModel = Payment,
   ProductModel = Product,
-  paymentProvider = mockPaymentProvider,
+  paymentProvider = mockPaymentProviderClient,
   startSession = () => mongoose.startSession(),
 } = {}) {
   const prepared = await preparePaymentAttempt(

@@ -24,6 +24,7 @@ function createProduct(overrides = {}) {
 function createModels({
   existingProduct = null,
   activeHeldOrder = null,
+  activePayment = null,
   createdProduct,
   updatedProduct,
 } = {}) {
@@ -33,12 +34,29 @@ function createModels({
     findOneAndUpdate: jest.fn().mockResolvedValue(
       updatedProduct ?? createProduct(),
     ),
-  };
-  const OrderModel = {
-    exists: jest.fn().mockResolvedValue(activeHeldOrder),
+    deleteMany: jest.fn().mockResolvedValue({ deletedCount: 1 }),
   };
 
-  return { ProductModel, OrderModel };
+  const OrderModel = {
+    exists: jest.fn().mockResolvedValue(activeHeldOrder),
+    deleteMany: jest.fn().mockResolvedValue({ deletedCount: 1 }),
+  };
+
+  const PaymentModel = {
+    exists: jest.fn().mockResolvedValue(activePayment),
+    deleteMany: jest.fn().mockResolvedValue({ deletedCount: 1 }),
+  };
+
+  const ProcessedWebhookModel = {
+    deleteMany: jest.fn().mockResolvedValue({ deletedCount: 1 }),
+  };
+
+  return {
+    ProductModel,
+    OrderModel,
+    PaymentModel,
+    ProcessedWebhookModel,
+  };
 }
 
 function createTestApp(models, options = {}) {
@@ -64,6 +82,25 @@ function putFixture(app, {
   if (headerRunId !== undefined) {
     testRequest = testRequest.set('X-Benchmark-Run-Id', headerRunId);
   }
+  if (typeof secret === 'string') {
+    testRequest = testRequest.set('X-Benchmark-Test-Secret', secret);
+  }
+
+  return testRequest;
+}
+
+function deleteRun(app, {
+  runId = RUN_ID,
+  headerRunId = runId,
+  secret = TEST_SECRET,
+} = {}) {
+  let testRequest = request(app)
+    .delete(`/_test/runs/${encodeURIComponent(runId)}`);
+
+  if (headerRunId !== undefined) {
+    testRequest = testRequest.set('X-Benchmark-Run-Id', headerRunId);
+  }
+
   if (typeof secret === 'string') {
     testRequest = testRequest.set('X-Benchmark-Test-Secret', secret);
   }
@@ -282,5 +319,61 @@ describe('test-only product fixture endpoint', () => {
       status: 'pending_payment',
       inventoryDisposition: 'held',
     });
+  });
+
+    test('deletes all data scoped to the requested run', async () => {
+    const models = createModels();
+    const response = await deleteRun(createTestApp(models));
+
+    expect(response.status).toBe(204);
+
+    for (const model of [
+      models.ProcessedWebhookModel,
+      models.PaymentModel,
+      models.OrderModel,
+      models.ProductModel,
+    ]) {
+      expect(model.deleteMany).toHaveBeenCalledWith({ runId: RUN_ID });
+    }
+  });
+
+  test('blocks cleanup while a payment operation is active', async () => {
+    const models = createModels({
+      activePayment: { _id: 'payment-1' },
+    });
+
+    const response = await deleteRun(createTestApp(models));
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('RUN_BUSY');
+
+    for (const model of [
+      models.ProcessedWebhookModel,
+      models.PaymentModel,
+      models.OrderModel,
+      models.ProductModel,
+    ]) {
+      expect(model.deleteMany).not.toHaveBeenCalled();
+    }
+  });
+
+  test('rejects cleanup when the path run ID differs from the header', async () => {
+    const models = createModels();
+    const response = await deleteRun(createTestApp(models), {
+      runId: 'run-other',
+      headerRunId: RUN_ID,
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('INVALID_REQUEST');
+
+    for (const model of [
+      models.ProcessedWebhookModel,
+      models.PaymentModel,
+      models.OrderModel,
+      models.ProductModel,
+    ]) {
+      expect(model.deleteMany).not.toHaveBeenCalled();
+    }
   });
 });

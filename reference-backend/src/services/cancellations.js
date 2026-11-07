@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import Order from '../models/order.js';
 import Payment from '../models/payment.js';
 import Product from '../models/product.js';
+import { processRefund } from './refunds.js';
 
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CANCELLABLE_PAYMENT_STATES = new Set(['voided', 'declined', 'refunded']);
@@ -58,6 +59,7 @@ export async function cancelOrder({
   OrderModel = Order,
   PaymentModel = Payment,
   ProductModel = Product,
+  processRefundService = processRefund,
   startSession = () => mongoose.startSession(),
 } = {}) {
   if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) {
@@ -68,8 +70,9 @@ export async function cancelOrder({
   }
 
   const session = await startSession();
+  let result;
   try {
-    const result = await session.withTransaction(async (transactionSession) => {
+    result = await session.withTransaction(async (transactionSession) => {
       const order = await OrderModel.findOne(
         { runId, _id: orderId },
         null,
@@ -108,7 +111,7 @@ export async function cancelOrder({
             order,
             payment,
             replayed: true,
-            httpStatus: 202,
+            resumeRefund: true,
           };
         }
         throw new OrderCancellationConflictError();
@@ -194,7 +197,7 @@ export async function cancelOrder({
           order: updatedOrder,
           payment: updatedPayment,
           replayed: false,
-          httpStatus: 202,
+          resumeRefund: true,
         };
       }
 
@@ -277,11 +280,44 @@ export async function cancelOrder({
       };
     });
 
-    if (!result) {
-      throw new Error('Order cancellation transaction returned no result');
-    }
-    return result;
   } finally {
     await session.endSession();
   }
+
+  if (!result) {
+    throw new Error('Order cancellation transaction returned no result');
+  }
+  if (!result.resumeRefund) {
+    return result;
+  }
+
+  const refundResult = await processRefundService({
+    runId,
+    paymentId: String(result.payment._id),
+  });
+  if (
+    !refundResult
+    || !refundResult.payment
+    || !refundResult.order
+    || refundResult.payment.runId !== runId
+    || refundResult.order.runId !== runId
+    || String(refundResult.payment._id) !== String(result.payment._id)
+    || String(refundResult.order._id) !== String(result.order._id)
+    || String(refundResult.order.paymentId) !== String(result.payment._id)
+    || !['refund_pending', 'refunded'].includes(refundResult.payment.status)
+    || !['cancellation_pending_refund', 'cancelled'].includes(refundResult.order.status)
+    || refundResult.order.inventoryDisposition !== 'released'
+    || (refundResult.payment.status === 'refund_pending'
+      && refundResult.order.status !== 'cancellation_pending_refund')
+    || (refundResult.payment.status === 'refunded'
+      && refundResult.order.status !== 'cancelled')
+  ) {
+    throw new Error('Refund service returned an invalid result');
+  }
+
+  return {
+    ...refundResult,
+    replayed: result.replayed,
+    httpStatus: refundResult.payment.status === 'refund_pending' ? 202 : 200,
+  };
 }

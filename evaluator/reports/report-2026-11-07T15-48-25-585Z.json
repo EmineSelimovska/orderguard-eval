@@ -1,0 +1,339 @@
+{
+  "generatedAt": "2026-11-07T15:48:25.584Z",
+  "target": "reference",
+  "startedAt": "2026-11-07T15:48:11.043Z",
+  "finishedAt": "2026-11-07T15:48:25.580Z",
+  "durationMs": 14537,
+  "summary": {
+    "scenarios": 4,
+    "passedScenarios": 4,
+    "failedScenarios": 0,
+    "totalChecks": 55,
+    "passedChecks": 55,
+    "failedChecks": 0,
+    "passed": true
+  },
+  "runIds": {
+    "duplicate": "run_duplicate_1076bbe8350f444c87df292dafe3486f",
+    "inventory": "run_inventory_1c6166dfd62a443db4be088aa1c069cb",
+    "webhook": "run_webhook_be1d355d04d44cf2a05f9c76a121403c",
+    "timeout": "run_timeout_8bccf870f3f94538b5879af7d5d6b9b2",
+    "cancellation": "run_cancellation_payment_race_8e72944db0d04c1597bba629d5d4820b"
+  },
+  "scenarios": [
+    {
+      "scenario": "Duplicate Order Prevention",
+      "runId": "run_duplicate_1076bbe8350f444c87df292dafe3486f",
+      "passed": true,
+      "checks": [
+        {
+          "name": "Product fixture created",
+          "passed": true
+        },
+        {
+          "name": "Concurrent requests return 201 and 200",
+          "passed": true
+        },
+        {
+          "name": "Both responses identify the same order and payment",
+          "passed": true
+        },
+        {
+          "name": "Exactly one response is marked as replay",
+          "passed": true
+        },
+        {
+          "name": "Exact replay returns 200 and the original identifiers",
+          "passed": true
+        },
+        {
+          "name": "Reusing the key with a different body returns 409",
+          "passed": true
+        },
+        {
+          "name": "Public order endpoint returns the persisted order",
+          "passed": true
+        },
+        {
+          "name": "Normalized observations endpoint returns 200",
+          "passed": true
+        },
+        {
+          "name": "Normalized observations show one order and one payment",
+          "passed": true
+        },
+        {
+          "name": "Independent MongoDB observer confirms one product with stock 3",
+          "passed": true
+        },
+        {
+          "name": "Independent MongoDB observer confirms one order for the key",
+          "passed": true
+        },
+        {
+          "name": "Independent MongoDB observer confirms one payment",
+          "passed": true
+        },
+        {
+          "name": "No provider charge was created during order creation",
+          "passed": true
+        }
+      ],
+      "evidence": {
+        "concurrentHttpStatuses": [
+          201,
+          200
+        ],
+        "orderId": "ord_6aef4840a24ff03dcbe6ba8a",
+        "paymentId": "pay_6aef4840a24ff03dcbe6ba8b",
+        "finalAvailable": 3,
+        "mongoOrderCount": 1,
+        "mongoPaymentCount": 1,
+        "providerOperationCount": 0
+      }
+    },
+    {
+      "scenario": "Inventory Race Condition",
+      "runId": "run_inventory_1c6166dfd62a443db4be088aa1c069cb",
+      "passed": true,
+      "checks": [
+        {
+          "name": "Product fixture created with one available unit",
+          "passed": true
+        },
+        {
+          "name": "Exactly one order succeeds and one conflicts",
+          "passed": true
+        },
+        {
+          "name": "The successful request created one pending order",
+          "passed": true
+        },
+        {
+          "name": "Normalized observations endpoint returns 200",
+          "passed": true
+        },
+        {
+          "name": "Normalized observations show stock zero and one order/payment",
+          "passed": true
+        },
+        {
+          "name": "Independent MongoDB observer confirms stock is zero",
+          "passed": true
+        },
+        {
+          "name": "Independent MongoDB observer confirms exactly one order",
+          "passed": true
+        },
+        {
+          "name": "Independent MongoDB observer confirms exactly one payment",
+          "passed": true
+        },
+        {
+          "name": "No provider charge was created during order creation",
+          "passed": true
+        }
+      ],
+      "evidence": {
+        "concurrentHttpStatuses": [
+          201,
+          409
+        ],
+        "successfulOrderId": "ord_6aef4841a24ff03dcbe6ba90",
+        "successfulPaymentId": "pay_6aef4841a24ff03dcbe6ba91",
+        "finalAvailable": 0,
+        "mongoOrderCount": 1,
+        "mongoPaymentCount": 1,
+        "providerOperationCount": 0
+      }
+    },
+    {
+      "scenario": "Duplicate Payment Webhook",
+      "runId": "run_webhook_be1d355d04d44cf2a05f9c76a121403c",
+      "passed": true,
+      "checks": [
+        {
+          "name": "Product fixture created",
+          "passed": true
+        },
+        {
+          "name": "Order created successfully",
+          "passed": true
+        },
+        {
+          "name": "Payment observations are available",
+          "passed": true
+        },
+        {
+          "name": "Payment identifiers and amount are valid",
+          "passed": true
+        },
+        {
+          "name": "Payment attempt succeeds",
+          "passed": true
+        },
+        {
+          "name": "Matching pre-applied success webhook is accepted",
+          "passed": true
+        },
+        {
+          "name": "Sequential duplicate webhook is idempotent",
+          "passed": true
+        },
+        {
+          "name": "Concurrent duplicate webhooks are accepted",
+          "passed": true
+        },
+        {
+          "name": "Same event ID with a different payload returns 409",
+          "passed": true
+        },
+        {
+          "name": "Final normalized observations are available",
+          "passed": true
+        },
+        {
+          "name": "Webhook duplicates did not create extra order/payment effects",
+          "passed": true
+        },
+        {
+          "name": "Independent MongoDB observer confirms one processed webhook",
+          "passed": true
+        },
+        {
+          "name": "Provider ledger confirms exactly one successful capture",
+          "passed": true
+        }
+      ],
+      "evidence": {
+        "orderId": "ord_6aef4842a24ff03dcbe6ba96",
+        "paymentId": "pay_6aef4842a24ff03dcbe6ba97",
+        "webhookEventId": "scenario-3-payment-success-event",
+        "sequentialReplayStatus": 200,
+        "concurrentWebhookStatuses": [
+          200,
+          200
+        ],
+        "alteredPayloadStatus": 409,
+        "mongoWebhookCount": 1,
+        "providerCaptureCount": 1
+      }
+    },
+    {
+      "scenario": "Payment Timeout & Retry",
+      "runId": "run_timeout_8bccf870f3f94538b5879af7d5d6b9b2",
+      "passed": true,
+      "checks": [
+        {
+          "name": "Product fixture created with two units",
+          "passed": true
+        },
+        {
+          "name": "Timeout before processing: order created",
+          "passed": true
+        },
+        {
+          "name": "Timeout before processing: payment observation available",
+          "passed": true
+        },
+        {
+          "name": "Timeout before processing: payment has a stable operation key",
+          "passed": true
+        },
+        {
+          "name": "Timeout before processing: first attempt returns HTTP 504",
+          "passed": true
+        },
+        {
+          "name": "Timeout before processing: timeout state is persisted correctly",
+          "passed": true
+        },
+        {
+          "name": "Timeout before processing: retry succeeds with HTTP 200",
+          "passed": true
+        },
+        {
+          "name": "Timeout before processing: retry completes the payment and order",
+          "passed": true
+        },
+        {
+          "name": "Timeout before processing: operation key remains unchanged",
+          "passed": true
+        },
+        {
+          "name": "Processed response timeout: order created",
+          "passed": true
+        },
+        {
+          "name": "Processed response timeout: payment observation available",
+          "passed": true
+        },
+        {
+          "name": "Processed response timeout: payment has a stable operation key",
+          "passed": true
+        },
+        {
+          "name": "Processed response timeout: first attempt returns HTTP 504",
+          "passed": true
+        },
+        {
+          "name": "Processed response timeout: timeout state is persisted correctly",
+          "passed": true
+        },
+        {
+          "name": "Processed response timeout: retry succeeds with HTTP 200",
+          "passed": true
+        },
+        {
+          "name": "Processed response timeout: retry completes the payment and order",
+          "passed": true
+        },
+        {
+          "name": "Processed response timeout: operation key remains unchanged",
+          "passed": true
+        },
+        {
+          "name": "Independent MongoDB observer confirms two payment records",
+          "passed": true
+        },
+        {
+          "name": "Provider ledger confirms exactly two charge operations",
+          "passed": true
+        },
+        {
+          "name": "Provider ledger confirms exactly two successful captures",
+          "passed": true
+        }
+      ],
+      "evidence": {
+        "cases": [
+          {
+            "name": "Timeout before processing",
+            "orderId": "ord_6aef4843a24ff03dcbe6ba9d",
+            "paymentId": "pay_6aef4843a24ff03dcbe6ba9e",
+            "operationKey": "op_6aef4843a24ff03dcbe6ba9f",
+            "firstAttemptStatus": 504,
+            "timeoutPaymentStatus": "pending",
+            "retryStatus": 200,
+            "finalPaymentStatus": "succeeded",
+            "finalOrderStatus": "paid"
+          },
+          {
+            "name": "Processed response timeout",
+            "orderId": "ord_6aef4845a24ff03dcbe6baa2",
+            "paymentId": "pay_6aef4845a24ff03dcbe6baa3",
+            "operationKey": "op_6aef4845a24ff03dcbe6baa4",
+            "firstAttemptStatus": 504,
+            "timeoutPaymentStatus": "unknown",
+            "retryStatus": 200,
+            "finalPaymentStatus": "succeeded",
+            "finalOrderStatus": "paid"
+          }
+        ],
+        "mongoPaymentCount": 2,
+        "providerOperationCount": 2,
+        "providerCaptureCount": 2
+      }
+    }
+  ]
+}

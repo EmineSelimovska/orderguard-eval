@@ -1,28 +1,25 @@
-import dotenv from 'dotenv';
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+
 import { createApp } from './app.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
-
-const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const repositoryEnv = resolve(packageRoot, '..', '.env');
-const localEnv = resolve(packageRoot, '.env');
-dotenv.config({ path: existsSync(repositoryEnv) ? repositoryEnv : localEnv });
 
 const app = createApp();
 const port = Number(process.env.PORT ?? 3000);
 let server;
 
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  throw new Error('PORT must be a valid TCP port');
+}
+
 try {
   await connectDatabase();
-  server = app.listen(port, () => {
-    console.log(`Candidate starter listening on port ${port}`);
+
+  server = app.listen(port, '127.0.0.1', () => {
+    console.log(`Candidate backend listening on port ${port}`);
   });
 } catch {
-  console.error('Candidate startup failed: could not connect to MongoDB Atlas');
-  process.exitCode = 1;
+  console.error('Candidate startup failed; connection details suppressed');
   await disconnectDatabase();
+  process.exitCode = 1;
 }
 
 async function shutdown() {
@@ -31,6 +28,7 @@ async function shutdown() {
       server.close((error) => (error ? reject(error) : resolveClose()));
     });
   }
+
   await disconnectDatabase();
 }
 
