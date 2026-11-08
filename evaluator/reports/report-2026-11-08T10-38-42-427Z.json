@@ -1,9 +1,9 @@
 {
-  "generatedAt": "2026-11-07T17:20:22.196Z",
+  "generatedAt": "2026-11-08T10:38:42.427Z",
   "target": "reference",
-  "startedAt": "2026-11-07T17:20:01.863Z",
-  "finishedAt": "2026-11-07T17:20:22.194Z",
-  "durationMs": 20331,
+  "startedAt": "2026-11-08T10:38:18.592Z",
+  "finishedAt": "2026-11-08T10:38:42.425Z",
+  "durationMs": 23833,
   "summary": {
     "scenarios": 6,
     "passedScenarios": 6,
@@ -14,17 +14,17 @@
     "passed": true
   },
   "runIds": {
-    "duplicate": "run_duplicate_f616d523795b4f5ea449255928a04983",
-    "inventory": "run_inventory_efda740d806144da82f56cde449079cb",
-    "webhook": "run_webhook_f8e71e0ffed14354a7751ec3eb160f21",
-    "timeout": "run_timeout_4205814af5be4e3c85758139d8b45b1b",
-    "cancellation": "run_cancellation_payment_race_1c08cd2287904fd381174349487a7f99",
-    "persistence": "run_persistence_5a8f373594b540f18960003e102be2fa"
+    "duplicate": "run_duplicate_7c34b8c4aa494c379245e6d990d39b2e",
+    "inventory": "run_inventory_8c4baf0a0ded4283926ec564bbf82679",
+    "webhook": "run_webhook_8d7cccbebed1448682a8d8f14cc136ee",
+    "timeout": "run_timeout_e770eae0ee08493fa1211c28a4aad56e",
+    "cancellation": "run_cancellation_payment_race_d2f353266d48460e8073a21efd9afc99",
+    "persistence": "run_persistence_79b2752b4ec94442813554740b14e30f"
   },
   "scenarios": [
     {
       "scenario": "Duplicate Order Prevention",
-      "runId": "run_duplicate_f616d523795b4f5ea449255928a04983",
+      "runId": "run_duplicate_7c34b8c4aa494c379245e6d990d39b2e",
       "passed": true,
       "checks": [
         {
@@ -82,11 +82,11 @@
       ],
       "evidence": {
         "concurrentHttpStatuses": [
-          201,
-          200
+          200,
+          201
         ],
-        "orderId": "ord_6aef5dc89b2c4ee6ecb7c430",
-        "paymentId": "pay_6aef5dc89b2c4ee6ecb7c431",
+        "orderId": "ord_6af0512119d8f13c807c0672",
+        "paymentId": "pay_6af0512119d8f13c807c0673",
         "finalAvailable": 3,
         "mongoOrderCount": 1,
         "mongoPaymentCount": 1,
@@ -95,7 +95,7 @@
     },
     {
       "scenario": "Inventory Race Condition",
-      "runId": "run_inventory_efda740d806144da82f56cde449079cb",
+      "runId": "run_inventory_8c4baf0a0ded4283926ec564bbf82679",
       "passed": true,
       "checks": [
         {
@@ -140,8 +140,8 @@
           201,
           409
         ],
-        "successfulOrderId": "ord_6aef5dc99b2c4ee6ecb7c436",
-        "successfulPaymentId": "pay_6aef5dc99b2c4ee6ecb7c437",
+        "successfulOrderId": "ord_6af0512319d8f13c807c0678",
+        "successfulPaymentId": "pay_6af0512319d8f13c807c0679",
         "finalAvailable": 0,
         "mongoOrderCount": 1,
         "mongoPaymentCount": 1,
@@ -150,7 +150,7 @@
     },
     {
       "scenario": "Duplicate Payment Webhook",
-      "runId": "run_webhook_f8e71e0ffed14354a7751ec3eb160f21",
+      "runId": "run_webhook_8d7cccbebed1448682a8d8f14cc136ee",
       "passed": true,
       "checks": [
         {
@@ -207,8 +207,8 @@
         }
       ],
       "evidence": {
-        "orderId": "ord_6aef5dca9b2c4ee6ecb7c43c",
-        "paymentId": "pay_6aef5dca9b2c4ee6ecb7c43d",
+        "orderId": "ord_6af0512419d8f13c807c067e",
+        "paymentId": "pay_6af0512419d8f13c807c067f",
         "webhookEventId": "scenario-3-payment-success-event",
         "sequentialReplayStatus": 200,
         "concurrentWebhookStatuses": [
@@ -222,7 +222,7 @@
     },
     {
       "scenario": "Payment Timeout & Retry",
-      "runId": "run_timeout_4205814af5be4e3c85758139d8b45b1b",
+      "runId": "run_timeout_e770eae0ee08493fa1211c28a4aad56e",
       "passed": true,
       "checks": [
         {
@@ -310,9 +310,9 @@
         "cases": [
           {
             "name": "Timeout before processing",
-            "orderId": "ord_6aef5dcc9b2c4ee6ecb7c443",
-            "paymentId": "pay_6aef5dcc9b2c4ee6ecb7c444",
-            "operationKey": "op_6aef5dcc9b2c4ee6ecb7c445",
+            "orderId": "ord_6af0512619d8f13c807c0685",
+            "paymentId": "pay_6af0512619d8f13c807c0686",
+            "operationKey": "op_6af0512619d8f13c807c0687",
             "firstAttemptStatus": 504,
             "timeoutPaymentStatus": "pending",
             "retryStatus": 200,
@@ -321,9 +321,9 @@
           },
           {
             "name": "Processed response timeout",
-            "orderId": "ord_6aef5dcd9b2c4ee6ecb7c448",
-            "paymentId": "pay_6aef5dcd9b2c4ee6ecb7c449",
-            "operationKey": "op_6aef5dcd9b2c4ee6ecb7c44a",
+            "orderId": "ord_6af0512719d8f13c807c068a",
+            "paymentId": "pay_6af0512719d8f13c807c068b",
+            "operationKey": "op_6af0512719d8f13c807c068c",
             "firstAttemptStatus": 504,
             "timeoutPaymentStatus": "unknown",
             "retryStatus": 200,
@@ -338,7 +338,7 @@
     },
     {
       "scenario": "Cancellation vs Payment Race",
-      "runId": "run_cancellation_payment_race_1c08cd2287904fd381174349487a7f99",
+      "runId": "run_cancellation_payment_race_d2f353266d48460e8073a21efd9afc99",
       "passed": true,
       "checks": [
         {
@@ -435,9 +435,9 @@
         }
       ],
       "evidence": {
-        "paymentFirstOrderId": "ord_6aef5dce9b2c4ee6ecb7c44e",
-        "cancellationFirstOrderId": "ord_6aef5dcf9b2c4ee6ecb7c453",
-        "lateSuccessOrderId": "ord_6aef5dd09b2c4ee6ecb7c458",
+        "paymentFirstOrderId": "ord_6af0512919d8f13c807c0690",
+        "cancellationFirstOrderId": "ord_6af0512919d8f13c807c0695",
+        "lateSuccessOrderId": "ord_6af0512a19d8f13c807c069a",
         "lateWebhookEventId": "scenario-5-late-payment-success-event",
         "lateWebhookReplayStatus": 200,
         "captureCount": 2,
@@ -447,7 +447,7 @@
     },
     {
       "scenario": "Persistence After Restart",
-      "runId": "run_persistence_5a8f373594b540f18960003e102be2fa",
+      "runId": "run_persistence_79b2752b4ec94442813554740b14e30f",
       "passed": true,
       "checks": [
         {
@@ -484,8 +484,8 @@
         }
       ],
       "evidence": {
-        "orderId": "ord_6aef5dd29b2c4ee6ecb7c45f",
-        "paymentId": "pay_6aef5dd29b2c4ee6ecb7c460",
+        "orderId": "ord_6af0512c19d8f13c807c06a1",
+        "paymentId": "pay_6af0512c19d8f13c807c06a2",
         "finalAvailable": 4,
         "mongoOrderCount": 1,
         "mongoPaymentCount": 1
